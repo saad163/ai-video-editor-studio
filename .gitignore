@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment secrets
+.env
+
+# Project runtime artifacts
+temp/chunks/*
+temp/frames/*
+temp/cache/*
+output/*
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# PyInstaller / Nuitka build artifacts
+*.spec
+dist_nuitka/
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Sample footage - keep locally
+assets/sample_footage/
+
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+
+assets/sample_footage/
+.venv/
+venv/
+.env
+__pycache__/
+*.pyc

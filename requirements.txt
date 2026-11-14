@@ -1,0 +1,36 @@
+# ============================================================
+# AI Video Editor Studio — Requirements
+# Phase 1: Core Infrastructure & Audio Pipeline
+# ============================================================
+
+# ── GUI ──────────────────────────────────────────────────────
+PySide6>=6.7.0
+
+# ── Audio / AI Transcription ─────────────────────────────────
+faster-whisper>=1.0.0
+
+# ── Google Generative AI (Gemini 1.5 Flash) ──────────────────
+google-generativeai>=0.7.0
+
+# ── Computer Vision / Media ──────────────────────────────────
+opencv-python-headless>=4.9.0
+scenedetect[opencv]>=0.6.0
+
+# ── Video / FFmpeg subprocess wrapper ────────────────────────
+ffmpeg-python>=0.2.0
+imageio-ffmpeg>=0.5.1              # Bundled FFmpeg binary — auto-fallback if FFmpeg not on PATH
+
+# ── Data Validation ──────────────────────────────────────────
+pydantic>=2.7.0
+
+# ── Environment & Config ─────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── Utilities ────────────────────────────────────────────────
+tqdm>=4.66.0
+numpy>=1.26.0
+Pillow>=10.3.0
+
+# ── Dev / Testing ────────────────────────────────────────────
+pytest>=8.0.0
+pytest-qt>=4.3.0
