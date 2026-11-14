@@ -73,7 +73,7 @@ def test_bulk_view_queue(qapp, tmp_path):
     view._insert_row(fake_audio)
 
     assert view.table.rowCount() == 1
-    assert "Chapter 01" in view.table.item(0, 1).text()
+    assert "chapter_01" in view.table.item(0, 1).text().lower()
     view.close()
 
 

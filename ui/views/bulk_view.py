@@ -20,13 +20,14 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QProgressBar,
     QFrame, QScrollArea, QCheckBox, QMessageBox, QAbstractItemView,
-    QComboBox, QSlider, QColorDialog, QListView
+    QComboBox, QSlider, QColorDialog, QListView, QSpinBox, QGridLayout
 )
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QColor, QPalette
 
 from utils.config import get_config
 from core.ffmpeg_wrapper import probe_media
+from services.character_matcher import CharacterMatcher, natural_sort_key
 from ui.workers.bulk_worker import BulkQueueWorker, BulkJob
 
 
@@ -90,7 +91,7 @@ class BulkView(QWidget):
         self._worker: Optional[BulkQueueWorker] = None
         self._is_paused = False
 
-        # Global typography settings
+        # Global typography & pipeline settings
         self._font_color = "#FFFF00"          # Yellow default
         self._highlight_color = "#FFFF00"
         self._stroke_color = "#000000"
@@ -98,11 +99,18 @@ class BulkView(QWidget):
         self._bg_style = "semi_transparent_black"
         self._has_bg_box = True
         self._bg_color = "#000000"
-        self._bg_opacity = 0.5
+        self._bg_opacity = 0.75
         self._font_size = 58
-        self._font_family = "Arial"
-        self._resolution = "2k"
+        self._font_family = "Montserrat"
+        self._is_bold = True
+        self._is_italic = False
+        self._font_case = "title"
+        self._box_padding = 14.0
+        self._resolution = "1080p"
         self._preset_name = "Viral Shorts (Yellow + Box)"
+        self._clip_duration = 5.0
+        self._image_ratio = 0.5
+        self._batch_limit = 0
 
         self._setup_ui()
 
@@ -146,13 +154,54 @@ class BulkView(QWidget):
 
         content_layout.addLayout(header_row)
 
-        # ── 2. Top Folder Selectors Card ───────────────────────────────────────
+        # ── Step 1: Bulk Template Pipeline Selector Card ───────────────────────
+        card_template = QFrame()
+        card_template.setObjectName("cardFrame")
+        tpl_layout = QVBoxLayout(card_template)
+        tpl_layout.setContentsMargins(18, 16, 18, 16)
+        tpl_layout.setSpacing(8)
+
+        tpl_header = QLabel("Step 1: Pipeline Template Mode")
+        tpl_header.setStyleSheet("font-size: 13px; font-weight: 700; color: #F8FAFC;")
+
+        self.combo_template = QComboBox()
+        self.combo_template.setView(_make_combo_view())
+        self.combo_template.addItems([
+            "Template 1 (Hybrid Images & Video Mix)",
+            "Template 2 (Episode Scene Matching)"
+        ])
+        self.combo_template.setStyleSheet("""
+            QComboBox {
+                background-color: #1A1A1F;
+                color: #F8FAFC;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QComboBox:hover { border-color: #818CF8; }
+        """)
+
+        tpl_desc = QLabel("Select rendering workflow: Template 1 mixes Ken Burns images and video b-roll clips, while Template 2 performs smart scene-matching across episode footage.")
+        tpl_desc.setStyleSheet("font-size: 11px; color: #94A3B8;")
+
+        tpl_layout.addWidget(tpl_header)
+        tpl_layout.addWidget(self.combo_template)
+        tpl_layout.addWidget(tpl_desc)
+        content_layout.addWidget(card_template)
+
+        # ── Step 2: Source Folders & Smart Auto-Pairing Setup Card ─────────────
         cfg = get_config()
         card_folders = QFrame()
         card_folders.setObjectName("cardFrame")
         folders_layout = QVBoxLayout(card_folders)
         folders_layout.setContentsMargins(18, 16, 18, 16)
         folders_layout.setSpacing(14)
+
+        folders_header = QLabel("Step 2: Source Folders & Smart Auto-Pairing Setup")
+        folders_header.setStyleSheet("font-size: 13px; font-weight: 700; color: #F8FAFC;")
+        folders_layout.addWidget(folders_header)
 
         # Folder 1: Audio Source Directory
         audio_in_box = QVBoxLayout()
@@ -200,7 +249,7 @@ class BulkView(QWidget):
         audio_in_row.addWidget(btn_scan_audio)
         audio_in_row.addWidget(btn_open_audio_dir)
 
-        audio_hint = QLabel("Select a folder containing voiceover audios. The scanner auto-pairs with matching character folders.")
+        audio_hint = QLabel("Select a folder containing voiceover audios (e.g. audio 1.mp3, audio 2.mp3). The scanner auto-pairs with matching numbered footage subfolders.")
         audio_hint.setStyleSheet("font-size: 11px; color: #94A3B8;")
 
         audio_in_box.addWidget(audio_in_lbl)
@@ -208,16 +257,64 @@ class BulkView(QWidget):
         audio_in_box.addWidget(audio_hint)
         folders_layout.addLayout(audio_in_box)
 
-        # Folder 2: Default Footage Library
+        # Batch Limit Control Row
+        limit_box = QVBoxLayout()
+        limit_box.setSpacing(4)
+        limit_header = QHBoxLayout()
+        limit_lbl = QLabel("Max Videos to Generate (Batch Limit):")
+        limit_lbl.setObjectName("fieldLabel")
+        limit_hint = QLabel("(0 = Process All Queued)")
+        limit_hint.setStyleSheet("font-size: 11px; color: #94A3B8;")
+        limit_header.addWidget(limit_lbl)
+        limit_header.addWidget(limit_hint)
+        limit_header.addStretch()
+
+        limit_row = QHBoxLayout()
+        limit_row.setSpacing(8)
+
+        self.spin_batch_limit = QSpinBox()
+        self.spin_batch_limit.setRange(0, 500)
+        self.spin_batch_limit.setValue(0)
+        self.spin_batch_limit.setSpecialValueText("All (No Limit)")
+        self.spin_batch_limit.setFixedWidth(140)
+        self.spin_batch_limit.setStyleSheet("""
+            QSpinBox {
+                background-color: #1A1A1F;
+                color: #F8FAFC;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QSpinBox:hover { border-color: #818CF8; }
+        """)
+
+        limit_row.addWidget(self.spin_batch_limit)
+        for val, lbl in [(0, "All"), (5, "5"), (10, "10"), (20, "20"), (50, "50")]:
+            btn_quick = QPushButton(lbl)
+            btn_quick.setFixedWidth(42)
+            btn_quick.setFixedHeight(28)
+            btn_quick.setCursor(Qt.PointingHandCursor)
+            btn_quick.setStyleSheet(BTN_INACTIVE_STYLE)
+            btn_quick.clicked.connect(lambda chk=False, v=val: self.spin_batch_limit.setValue(v))
+            limit_row.addWidget(btn_quick)
+        limit_row.addStretch()
+
+        limit_box.addLayout(limit_header)
+        limit_box.addLayout(limit_row)
+        folders_layout.addLayout(limit_box)
+
+        # Folder 2: Footage Assets Root Directory
         footage_box = QVBoxLayout()
         footage_box.setSpacing(4)
-        footage_lbl = QLabel("Footage Library / Visual Assets Folder")
+        footage_lbl = QLabel("Main Footage Root Folder (Visual Assets Root)")
         footage_lbl.setObjectName("fieldLabel")
         footage_row = QHBoxLayout()
         footage_row.setSpacing(8)
 
         self.edit_footage_dir = QLineEdit()
-        self.edit_footage_dir.setPlaceholderText("Select folder containing visual assets or character subfolders...")
+        self.edit_footage_dir.setPlaceholderText("Select root folder containing numbered subfolders or visual assets...")
         sample_footage = cfg.project_root / "assets" / "sample_footage"
         if sample_footage.exists():
             self.edit_footage_dir.setText(str(sample_footage))
@@ -238,7 +335,7 @@ class BulkView(QWidget):
         footage_row.addWidget(btn_browse_footage)
         footage_row.addWidget(btn_open_footage)
 
-        footage_hint = QLabel("Default media directory used when an audio file doesn't have an exact matching subfolder.")
+        footage_hint = QLabel("Root folder containing numbered video/character subfolders (e.g. 'video 1 content/', 'video 2 content/'). Auto-pairs or falls back to root.")
         footage_hint.setStyleSheet("font-size: 11px; color: #94A3B8;")
 
         footage_box.addWidget(footage_lbl)
@@ -246,10 +343,10 @@ class BulkView(QWidget):
         footage_box.addWidget(footage_hint)
         folders_layout.addLayout(footage_box)
 
-        # Folder 3: Output Destination
+        # Folder 3: Output Destination & Resolution
         out_box = QVBoxLayout()
         out_box.setSpacing(4)
-        out_lbl = QLabel("Output Destination Folder")
+        out_lbl = QLabel("Output Destination & Export Resolution")
         out_lbl.setObjectName("fieldLabel")
         out_row = QHBoxLayout()
         out_row.setSpacing(8)
@@ -270,11 +367,34 @@ class BulkView(QWidget):
         btn_open_out.setCursor(Qt.PointingHandCursor)
         btn_open_out.clicked.connect(lambda: self._open_in_explorer(self.edit_output_dir.text()))
 
-        out_row.addWidget(self.edit_output_dir)
+        self.combo_res = QComboBox()
+        self.combo_res.setView(_make_combo_view())
+        self.combo_res.addItems([
+            "1080p Full HD (1920x1080)",
+            "720p HD (1280x720)",
+            "2K QHD (2560x1440)",
+        ])
+        self.combo_res.setFixedWidth(200)
+        self.combo_res.setStyleSheet("""
+            QComboBox {
+                background-color: #1A1A1F;
+                color: #F8FAFC;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QComboBox:hover { border-color: #818CF8; }
+        """)
+        self.combo_res.currentIndexChanged.connect(self._on_res_changed)
+
+        out_row.addWidget(self.edit_output_dir, stretch=2)
         out_row.addWidget(btn_browse_out)
         out_row.addWidget(btn_open_out)
+        out_row.addWidget(self.combo_res)
 
-        out_hint = QLabel("Completed 2K/1080p videos and generated .srt / .txt chapters are saved here.")
+        out_hint = QLabel("Select destination folder and export resolution preset (1080p Full HD default, 2K QHD, or 720p HD).")
         out_hint.setStyleSheet("font-size: 11px; color: #94A3B8;")
 
         out_box.addWidget(out_lbl)
@@ -284,7 +404,62 @@ class BulkView(QWidget):
 
         content_layout.addWidget(card_folders)
 
-        # ── 3. Global Batch Typography & Output Settings Card ─────────────────
+        # ── Step 3: Timing & Media Mix Settings Card ───────────────────────────
+        card_timing = QFrame()
+        card_timing.setObjectName("cardFrame")
+        timing_layout = QVBoxLayout(card_timing)
+        timing_layout.setContentsMargins(18, 16, 18, 16)
+        timing_layout.setSpacing(14)
+
+        t_hdr = QLabel("Step 3: Timing & Media Mix Settings")
+        t_hdr.setStyleSheet("font-size: 13px; font-weight: 700; color: #F8FAFC;")
+        timing_layout.addWidget(t_hdr)
+
+        # Control 1: Clip / Image Hold Duration
+        dur_header = QHBoxLayout()
+        dur_lbl = QLabel("Clip / Image Duration (sec):")
+        dur_lbl.setStyleSheet("font-size: 12px; font-weight: 600; color: #E2E8F0;")
+        self.lbl_clip_dur_val = QLabel("5.0 s")
+        self.lbl_clip_dur_val.setStyleSheet("font-size: 12px; font-weight: 700; color: #FB923C;")
+        dur_header.addWidget(dur_lbl)
+        dur_header.addStretch()
+        dur_header.addWidget(self.lbl_clip_dur_val)
+        timing_layout.addLayout(dur_header)
+
+        self.slider_clip_dur = QSlider(Qt.Horizontal)
+        self.slider_clip_dur.setRange(1, 20)
+        self.slider_clip_dur.setValue(5)
+        self.slider_clip_dur.valueChanged.connect(self._on_clip_dur_changed)
+        timing_layout.addWidget(self.slider_clip_dur)
+
+        dur_hint = QLabel("Controls continuous display length before transitioning to the next visual still or video b-roll.")
+        dur_hint.setStyleSheet("font-size: 11px; color: #71717A;")
+        timing_layout.addWidget(dur_hint)
+
+        # Control 2: Media Mix Ratio
+        mix_header = QHBoxLayout()
+        mix_lbl = QLabel("Media Mix Ratio (Images vs. Video Footage):")
+        mix_lbl.setStyleSheet("font-size: 12px; font-weight: 600; color: #E2E8F0;")
+        self.lbl_mix_ratio_val = QLabel("Images: 50% | Video Clips: 50%")
+        self.lbl_mix_ratio_val.setStyleSheet("font-size: 12px; font-weight: 700; color: #38BDF8;")
+        mix_header.addWidget(mix_lbl)
+        mix_header.addStretch()
+        mix_header.addWidget(self.lbl_mix_ratio_val)
+        timing_layout.addLayout(mix_header)
+
+        self.slider_mix_ratio = QSlider(Qt.Horizontal)
+        self.slider_mix_ratio.setRange(0, 100)
+        self.slider_mix_ratio.setValue(50)
+        self.slider_mix_ratio.valueChanged.connect(self._on_mix_ratio_changed)
+        timing_layout.addWidget(self.slider_mix_ratio)
+
+        mix_hint = QLabel("Controls ratio of Ken Burns character stills vs. sliced raw episode video clips for Template 1.")
+        mix_hint.setStyleSheet("font-size: 11px; color: #71717A;")
+        timing_layout.addWidget(mix_hint)
+
+        content_layout.addWidget(card_timing)
+
+        # ── Step 4: Subtitles & Typography Studio (Global Batch Settings) ─────
         self.style_frame = QFrame()
         self.style_frame.setObjectName("cardFrame")
         style_layout = QVBoxLayout(self.style_frame)
@@ -292,7 +467,7 @@ class BulkView(QWidget):
         style_layout.setSpacing(14)
 
         # Header Toggle Button
-        self.btn_toggle_style = QPushButton("▲  Global Typography & Output Settings For Batch")
+        self.btn_toggle_style = QPushButton("▲  Step 4: Subtitles & Typography Studio (Global Batch Settings)")
         self.btn_toggle_style.setCursor(Qt.PointingHandCursor)
         self.btn_toggle_style.setStyleSheet("""
             QPushButton {
@@ -312,92 +487,68 @@ class BulkView(QWidget):
         self.style_body = QWidget()
         body_layout = QVBoxLayout(self.style_body)
         body_layout.setContentsMargins(2, 2, 2, 2)
-        body_layout.setSpacing(14)
+        body_layout.setSpacing(12)
 
-        # Row A: Quick Style Preset & Resolution
-        row_a = QHBoxLayout()
-        row_a.setSpacing(16)
-
-        preset_box = QVBoxLayout()
-        preset_box.setSpacing(4)
-        preset_lbl = QLabel("Quick Style Preset (Applied to all batch items):")
-        preset_lbl.setStyleSheet("font-size: 12px; font-weight: 700; color: #818CF8;")
+        # Row 1: Quick Style Presets
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(10)
+        p_lbl = QLabel("Style Preset:")
+        p_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #A1A1AA;")
         self.combo_presets = QComboBox()
         self.combo_presets.setView(_make_combo_view())
         self.combo_presets.addItems([
-            "Viral Shorts (Yellow Text + Semi-Transparent Black Box)",
-            "Classic YouTube (White Text + Black Outline)",
-            "High-Contrast Box (Yellow Text + Solid Black Box)",
-            "Cinematic Minimalist (Pure White + Soft Box)",
-            "Custom Style"
+            "Classic YouTube (Bold Yellow Highlight)",
+            "Viral Shorts (Yellow + Box)",
+            "High-Contrast Box (White + Solid Black)",
+            "Minimal Clean (White + Outline)",
+            "Cinematic Teal"
         ])
         self.combo_presets.currentIndexChanged.connect(self._on_preset_changed)
-        preset_box.addWidget(preset_lbl)
-        preset_box.addWidget(self.combo_presets)
-        row_a.addLayout(preset_box, stretch=3)
+        preset_row.addWidget(p_lbl)
+        preset_row.addWidget(self.combo_presets, stretch=1)
+        body_layout.addLayout(preset_row)
 
-        res_box = QVBoxLayout()
-        res_box.setSpacing(4)
-        res_lbl = QLabel("Output Resolution:")
-        res_lbl.setStyleSheet("font-size: 12px; font-weight: 600; color: #CBD5E1;")
-        self.combo_res = QComboBox()
-        self.combo_res.setView(_make_combo_view())
-        self.combo_res.addItems([
-            "1080p (1920x1080) - Default",
-            "2K (2560x1440) - Recommended",
-            "720p (1280x720) - Compact",
-        ])
-        self.combo_res.currentIndexChanged.connect(self._on_res_changed)
-        res_box.addWidget(res_lbl)
-        res_box.addWidget(self.combo_res)
-        row_a.addLayout(res_box, stretch=2)
+        # Row 2: Aa Quick Swatches Row
+        swatch_row = QHBoxLayout()
+        swatch_row.setSpacing(6)
+        swatches = [
+            ("#FFFF00", "#000000", "Yellow"),
+            ("#FFFFFF", "#000000", "White"),
+            ("#38BDF8", "#000000", "Cyan"),
+            ("#34D399", "#000000", "Green"),
+            ("#FB923C", "#000000", "Coral"),
+            ("#A78BFA", "#000000", "Violet"),
+        ]
+        for font_c, stroke_c, lbl in swatches:
+            btn_s = QPushButton(f"Aa\n{lbl}")
+            btn_s.setFixedSize(54, 38)
+            btn_s.setCursor(Qt.PointingHandCursor)
+            btn_s.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #1A1A20;
+                    color: {font_c};
+                    border: 1px solid #32323D;
+                    border-radius: 6px;
+                    font-size: 9px;
+                    font-weight: 700;
+                    padding: 0;
+                }}
+                QPushButton:hover {{
+                    border: 1.5px solid {font_c};
+                    background-color: #22222A;
+                }}
+            """)
+            btn_s.clicked.connect(lambda chk=False, fc=font_c, sc=stroke_c: self._apply_preset_color(fc, sc))
+            swatch_row.addWidget(btn_s)
+        swatch_row.addStretch()
+        body_layout.addLayout(swatch_row)
 
-        # Clip Duration Selector in Batch Bar
-        dur_box = QVBoxLayout()
-        dur_box.setSpacing(4)
-        dur_hdr = QHBoxLayout()
-        dur_lbl = QLabel("Clip Hold Duration:")
-        dur_lbl.setStyleSheet("font-size: 12px; font-weight: 600; color: #CBD5E1;")
-        self.lbl_clip_dur_val = QLabel("5.0 s")
-        self.lbl_clip_dur_val.setStyleSheet("font-size: 12px; font-weight: 700; color: #FB923C;")
-        dur_hdr.addWidget(dur_lbl)
-        dur_hdr.addStretch()
-        dur_hdr.addWidget(self.lbl_clip_dur_val)
-        dur_box.addLayout(dur_hdr)
+        # Row 3: Font Family, Background Box Mode, Box Opacity Grid
+        font_grid = QGridLayout()
+        font_grid.setSpacing(10)
 
-        self.slider_clip_dur = QSlider(Qt.Horizontal)
-        self.slider_clip_dur.setRange(1, 20)
-        self.slider_clip_dur.setValue(5)
-        self.slider_clip_dur.valueChanged.connect(lambda v: self.lbl_clip_dur_val.setText(f"{v}.0 s"))
-        dur_box.addWidget(self.slider_clip_dur)
-        row_a.addLayout(dur_box, stretch=2)
-
-        body_layout.addLayout(row_a)
-
-        # Row B: Background Box Style & Font Name
-        row_b = QHBoxLayout()
-        row_b.setSpacing(16)
-
-        bg_box = QVBoxLayout()
-        bg_box.setSpacing(4)
-        bg_lbl = QLabel("Background Box Style:")
-        bg_lbl.setStyleSheet("font-size: 12px; font-weight: 600; color: #CBD5E1;")
-        self.combo_bg = QComboBox()
-        self.combo_bg.setView(_make_combo_view())
-        self.combo_bg.addItems([
-            "Semi-Transparent Black Box (YouTube / CapCut Style)",
-            "Solid Black Box (Maximum Contrast)",
-            "Clean Outline Only (No Box)"
-        ])
-        self.combo_bg.currentIndexChanged.connect(self._on_bg_changed)
-        bg_box.addWidget(bg_lbl)
-        bg_box.addWidget(self.combo_bg)
-        row_b.addLayout(bg_box, stretch=3)
-
-        font_box = QVBoxLayout()
-        font_box.setSpacing(4)
-        font_lbl = QLabel("Font Name:")
-        font_lbl.setStyleSheet("font-size: 12px; font-weight: 600; color: #CBD5E1;")
+        ff_lbl = QLabel("Font Family")
+        ff_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #A1A1AA;")
         self.combo_font = QComboBox()
         self.combo_font.setView(_make_combo_view())
         self.combo_font.addItems([
@@ -408,69 +559,197 @@ class BulkView(QWidget):
             "Impact",
             "Segoe UI",
             "Georgia",
-            "Arial"
+            "Arial",
         ])
-        self.combo_font.currentTextChanged.connect(self._update_preview)
-        font_box.addWidget(font_lbl)
-        font_box.addWidget(self.combo_font)
-        row_b.addLayout(font_box, stretch=3)
+        self.combo_font.currentTextChanged.connect(lambda: self._update_preview())
+        font_grid.addWidget(ff_lbl, 0, 0)
+        font_grid.addWidget(self.combo_font, 1, 0)
 
-        body_layout.addLayout(row_b)
+        bg_lbl = QLabel("Background Box Mode")
+        bg_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #A1A1AA;")
+        self.combo_bg = QComboBox()
+        self.combo_bg.setView(_make_combo_view())
+        self.combo_bg.addItems([
+            "Outline Mode",
+            "Semi-Transparent Box",
+            "Solid Box",
+            "Custom Box",
+        ])
+        self.combo_bg.currentIndexChanged.connect(self._on_bg_changed)
+        font_grid.addWidget(bg_lbl, 0, 1)
+        font_grid.addWidget(self.combo_bg, 1, 1)
 
-        # Row C: Font Size Slider & Color Pickers
-        row_c = QHBoxLayout()
-        row_c.setSpacing(16)
+        opac_lbl = QLabel("Box Opacity")
+        opac_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #A1A1AA;")
+        self.combo_box_opacity = QComboBox()
+        self.combo_box_opacity.setView(_make_combo_view())
+        self.combo_box_opacity.addItems([
+            "Semi-Transparent (75%)",
+            "Solid (100%)",
+            "Subtle (50%)",
+        ])
+        self.combo_box_opacity.currentIndexChanged.connect(self._on_opacity_changed)
+        font_grid.addWidget(opac_lbl, 0, 2)
+        font_grid.addWidget(self.combo_box_opacity, 1, 2)
 
-        fs_box = QVBoxLayout()
-        fs_box.setSpacing(4)
-        fs_header = QHBoxLayout()
+        body_layout.addLayout(font_grid)
+
+        # Row 4: Font Size Slider Row
+        fs_row = QHBoxLayout()
         fs_lbl = QLabel("Font Size:")
-        fs_lbl.setStyleSheet("font-size: 12px; font-weight: 600; color: #CBD5E1;")
+        fs_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #A1A1AA;")
         self.lbl_fs_val = QLabel(f"{self._font_size} pt")
-        self.lbl_fs_val.setStyleSheet("font-size: 12px; font-weight: 700; color: #818CF8;")
-        fs_header.addWidget(fs_lbl)
-        fs_header.addStretch()
-        fs_header.addWidget(self.lbl_fs_val)
-
+        self.lbl_fs_val.setStyleSheet("font-size: 12px; font-weight: 700; color: #FB923C;")
         self.slider_fs = QSlider(Qt.Horizontal)
-        self.slider_fs.setRange(28, 96)
+        self.slider_fs.setRange(32, 90)
         self.slider_fs.setValue(self._font_size)
         self.slider_fs.valueChanged.connect(self._on_fs_changed)
-        fs_box.addLayout(fs_header)
-        fs_box.addWidget(self.slider_fs)
-        row_c.addLayout(fs_box, stretch=3)
+        fs_row.addWidget(fs_lbl)
+        fs_row.addWidget(self.slider_fs, stretch=1)
+        fs_row.addWidget(self.lbl_fs_val)
+        body_layout.addLayout(fs_row)
 
-        # Text Color Swatch
-        col_box = QVBoxLayout()
-        col_box.setSpacing(4)
-        col_lbl = QLabel("Subtitle Color")
-        col_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8;")
-        self.btn_col_swatch = QPushButton("")
-        self.btn_col_swatch.setFixedSize(38, 28)
+        # Row 5: Patterns, Case & Color Pickers
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(12)
+
+        # Pattern buttons (B, I, U)
+        pat_box = QHBoxLayout()
+        pat_box.setSpacing(4)
+        self.btn_bold = QPushButton("B")
+        self.btn_bold.setFixedSize(30, 28)
+        self.btn_bold.setCursor(Qt.PointingHandCursor)
+        self.btn_bold.setStyleSheet(BTN_ACTIVE_STYLE)
+        self.btn_bold.clicked.connect(lambda: self._toggle_pattern_btn(self.btn_bold))
+
+        self.btn_italic = QPushButton("I")
+        self.btn_italic.setFixedSize(30, 28)
+        self.btn_italic.setCursor(Qt.PointingHandCursor)
+        self.btn_italic.setStyleSheet(BTN_INACTIVE_STYLE)
+        self.btn_italic.clicked.connect(lambda: self._toggle_pattern_btn(self.btn_italic))
+
+        self.btn_underline = QPushButton("U")
+        self.btn_underline.setFixedSize(30, 28)
+        self.btn_underline.setCursor(Qt.PointingHandCursor)
+        self.btn_underline.setStyleSheet(BTN_INACTIVE_STYLE)
+        self.btn_underline.clicked.connect(lambda: self._toggle_pattern_btn(self.btn_underline))
+
+        pat_box.addWidget(self.btn_bold)
+        pat_box.addWidget(self.btn_italic)
+        pat_box.addWidget(self.btn_underline)
+        controls_row.addLayout(pat_box)
+
+        # Case buttons (TT, tt, Tt)
+        case_box = QHBoxLayout()
+        case_box.setSpacing(4)
+        self.btn_case_upper = QPushButton("TT")
+        self.btn_case_upper.setFixedSize(30, 28)
+        self.btn_case_upper.setCursor(Qt.PointingHandCursor)
+        self.btn_case_upper.setStyleSheet(BTN_INACTIVE_STYLE)
+        self.btn_case_upper.clicked.connect(lambda: self._set_case("upper"))
+
+        self.btn_case_lower = QPushButton("tt")
+        self.btn_case_lower.setFixedSize(30, 28)
+        self.btn_case_lower.setCursor(Qt.PointingHandCursor)
+        self.btn_case_lower.setStyleSheet(BTN_INACTIVE_STYLE)
+        self.btn_case_lower.clicked.connect(lambda: self._set_case("lower"))
+
+        self.btn_case_title = QPushButton("Tt")
+        self.btn_case_title.setFixedSize(30, 28)
+        self.btn_case_title.setCursor(Qt.PointingHandCursor)
+        self.btn_case_title.setStyleSheet(BTN_ACTIVE_STYLE)
+        self.btn_case_title.clicked.connect(lambda: self._set_case("title"))
+
+        case_box.addWidget(self.btn_case_upper)
+        case_box.addWidget(self.btn_case_lower)
+        case_box.addWidget(self.btn_case_title)
+        controls_row.addLayout(case_box)
+
+        # Color Swatches Pickers
+        col_box = QHBoxLayout()
+        col_box.setSpacing(6)
+        col_lbl = QLabel("Text:")
+        col_lbl.setStyleSheet("font-size: 11px; color: #A1A1AA;")
+        self.btn_col_swatch = QPushButton()
+        self.btn_col_swatch.setFixedSize(26, 26)
         self.btn_col_swatch.setCursor(Qt.PointingHandCursor)
-        self.btn_col_swatch.setStyleSheet(f"background-color: {self._font_color}; border: 1.5px solid #334155; border-radius: 6px;")
+        self.btn_col_swatch.setStyleSheet(f"background-color: {self._font_color}; border: 1.5px solid #334155; border-radius: 5px;")
+        self.btn_col_swatch.setToolTip("Font Text Color")
         self.btn_col_swatch.clicked.connect(self._pick_color)
+
+        hl_lbl = QLabel("Word:")
+        hl_lbl.setStyleSheet("font-size: 11px; color: #A1A1AA;")
+        self.btn_hl_swatch = QPushButton()
+        self.btn_hl_swatch.setFixedSize(26, 26)
+        self.btn_hl_swatch.setCursor(Qt.PointingHandCursor)
+        self.btn_hl_swatch.setStyleSheet(f"background-color: {self._highlight_color}; border: 1.5px solid #334155; border-radius: 5px;")
+        self.btn_hl_swatch.setToolTip("Active Word Highlight Color")
+        self.btn_hl_swatch.clicked.connect(self._pick_hl_color)
+
+        bg_col_lbl = QLabel("Box:")
+        bg_col_lbl.setStyleSheet("font-size: 11px; color: #A1A1AA;")
+        self.btn_bg_swatch = QPushButton()
+        self.btn_bg_swatch.setFixedSize(26, 26)
+        self.btn_bg_swatch.setCursor(Qt.PointingHandCursor)
+        self.btn_bg_swatch.setStyleSheet(f"background-color: {self._bg_color}; border: 1.5px solid #334155; border-radius: 5px;")
+        self.btn_bg_swatch.setToolTip("Background Box Fill Color")
+        self.btn_bg_swatch.clicked.connect(self._pick_bg_color)
+
         col_box.addWidget(col_lbl)
         col_box.addWidget(self.btn_col_swatch)
-        row_c.addLayout(col_box)
+        col_box.addWidget(hl_lbl)
+        col_box.addWidget(self.btn_hl_swatch)
+        col_box.addWidget(bg_col_lbl)
+        col_box.addWidget(self.btn_bg_swatch)
+        controls_row.addLayout(col_box)
+        controls_row.addStretch()
+        body_layout.addLayout(controls_row)
 
-        # Highlight Color Swatch
-        hl_box = QVBoxLayout()
-        hl_box.setSpacing(4)
-        hl_lbl = QLabel("Highlight Color")
-        hl_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8;")
-        self.btn_hl_swatch = QPushButton("")
-        self.btn_hl_swatch.setFixedSize(38, 28)
-        self.btn_hl_swatch.setCursor(Qt.PointingHandCursor)
-        self.btn_hl_swatch.setStyleSheet(f"background-color: {self._highlight_color}; border: 1.5px solid #334155; border-radius: 6px;")
-        self.btn_hl_swatch.clicked.connect(self._pick_hl_color)
-        hl_box.addWidget(hl_lbl)
-        hl_box.addWidget(self.btn_hl_swatch)
-        row_c.addLayout(hl_box)
+        # Row 6: Stroke Outline & Box Padding Controls
+        stroke_pad_row = QHBoxLayout()
+        stroke_pad_row.setSpacing(16)
 
-        body_layout.addLayout(row_c)
+        # Stroke Outline
+        s_box = QHBoxLayout()
+        s_box.setSpacing(6)
+        s_lbl = QLabel("Stroke:")
+        s_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #A1A1AA;")
+        self.btn_stroke_swatch = QPushButton()
+        self.btn_stroke_swatch.setFixedSize(26, 26)
+        self.btn_stroke_swatch.setCursor(Qt.PointingHandCursor)
+        self.btn_stroke_swatch.setStyleSheet(f"background-color: {self._stroke_color}; border: 1.5px solid #334155; border-radius: 5px;")
+        self.btn_stroke_swatch.clicked.connect(self._pick_stroke_color)
+        self.slider_stroke = QSlider(Qt.Horizontal)
+        self.slider_stroke.setRange(1, 10)
+        self.slider_stroke.setValue(4)
+        self.slider_stroke.valueChanged.connect(self._on_stroke_changed)
+        self.lbl_stroke_val = QLabel(f"{self._stroke_thickness:.1f} px")
+        self.lbl_stroke_val.setStyleSheet("font-size: 11px; font-weight: 600; color: #A1A1AA;")
+        s_box.addWidget(s_lbl)
+        s_box.addWidget(self.btn_stroke_swatch)
+        s_box.addWidget(self.slider_stroke, stretch=1)
+        s_box.addWidget(self.lbl_stroke_val)
+        stroke_pad_row.addLayout(s_box, stretch=1)
 
-        # Row D: Checkboxes
+        # Box Padding
+        p_box = QHBoxLayout()
+        p_box.setSpacing(6)
+        p_lbl = QLabel("Box Padding:")
+        p_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #A1A1AA;")
+        self.slider_box_padding = QSlider(Qt.Horizontal)
+        self.slider_box_padding.setRange(6, 28)
+        self.slider_box_padding.setValue(int(self._box_padding))
+        self.slider_box_padding.valueChanged.connect(self._on_box_padding_changed)
+        self.lbl_box_pad_val = QLabel(f"{int(self._box_padding)} px")
+        self.lbl_box_pad_val.setStyleSheet("font-size: 11px; font-weight: 600; color: #A1A1AA;")
+        p_box.addWidget(p_lbl)
+        p_box.addWidget(self.slider_box_padding, stretch=1)
+        p_box.addWidget(self.lbl_box_pad_val)
+        stroke_pad_row.addLayout(p_box, stretch=1)
+
+        body_layout.addLayout(stroke_pad_row)
+
+        # Row 7: Checkboxes
         check_row = QHBoxLayout()
         self.chk_chapters = QCheckBox("Auto-Generate YouTube Chapters (.txt) for each video")
         self.chk_chapters.setChecked(True)
@@ -482,7 +761,7 @@ class BulkView(QWidget):
         check_row.addStretch()
         body_layout.addLayout(check_row)
 
-        # Row E: Preview Banner
+        # Row 8: Preview Banner
         self.preview_banner = QFrame()
         self.preview_banner.setFixedHeight(76)
         self.preview_banner.setStyleSheet("""
@@ -553,7 +832,7 @@ class BulkView(QWidget):
         # ── 5. Batch Queue Table ───────────────────────────────────────────────
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
-            "#", "Title", "Audio File", "Assets Folder", "Style Preset", "Progress", "Status", "Actions"
+            "#", "Audio File", "Matched Footage Folder", "Template", "Output Path", "Progress", "Status", "Actions"
         ])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
@@ -565,13 +844,13 @@ class BulkView(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Fixed)
 
         self.table.setColumnWidth(0, 36)
-        self.table.setColumnWidth(1, 190)
-        self.table.setColumnWidth(2, 160)
-        self.table.setColumnWidth(3, 160)
-        self.table.setColumnWidth(4, 150)
-        self.table.setColumnWidth(5, 120)
-        self.table.setColumnWidth(6, 110)
-        self.table.setColumnWidth(7, 85)
+        self.table.setColumnWidth(1, 160)
+        self.table.setColumnWidth(2, 220)
+        self.table.setColumnWidth(3, 110)
+        self.table.setColumnWidth(4, 180)
+        self.table.setColumnWidth(5, 110)
+        self.table.setColumnWidth(6, 100)
+        self.table.setColumnWidth(7, 80)
 
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
@@ -611,73 +890,182 @@ class BulkView(QWidget):
         self._is_style_open = not self._is_style_open
         self.style_body.setVisible(self._is_style_open)
         arrow = "▲" if self._is_style_open else "▼"
-        self.btn_toggle_style.setText(f"{arrow}  Global Typography & Output Settings For Batch")
+        self.btn_toggle_style.setText(f"{arrow}  Step 4: Subtitles & Typography Studio (Global Batch Settings)")
 
     def _on_preset_changed(self, idx: int) -> None:
-        if idx == 0:  # Viral Shorts (Yellow + Semi-Transparent Box)
-            self._font_color = "#FFFF00"
-            self._highlight_color = "#00FFFF"
-            self._bg_style = "semi_transparent_black"
-            self._has_bg_box = True
-            self._bg_opacity = 0.5
-            self.combo_bg.blockSignals(True)
-            self.combo_bg.setCurrentIndex(0)
-            self.combo_bg.blockSignals(False)
-            self.combo_font.setCurrentText("Montserrat Bold")
-            self.slider_fs.setValue(58)
-            self._preset_name = "Viral Shorts (Yellow + Box)"
-        elif idx == 1:  # Classic YouTube (White + Outline)
+        if idx == 0:  # Classic YouTube (Bold Yellow Highlight)
             self._font_color = "#FFFFFF"
             self._highlight_color = "#FFFF00"
+            self._stroke_color = "#000000"
+            self._stroke_thickness = 3.5
             self._bg_style = "outline"
             self._has_bg_box = False
             self.combo_bg.blockSignals(True)
-            self.combo_bg.setCurrentIndex(2)
+            self.combo_bg.setCurrentIndex(0)  # Outline
             self.combo_bg.blockSignals(False)
-            self.combo_font.setCurrentText("Arial (Classic YouTube Bold)")
+            self.combo_font.setCurrentText("Arial Black")
             self.slider_fs.setValue(56)
-            self._preset_name = "Classic YouTube (White + Outline)"
-        elif idx == 2:  # High-Contrast Box (Yellow + Solid Black Box)
+            self._is_bold = True
+            self._is_italic = False
+            self._preset_name = "Classic YouTube (Bold Yellow Highlight)"
+        elif idx == 1:  # Viral Shorts (Yellow + Box)
             self._font_color = "#FFFF00"
-            self._highlight_color = "#FFFFFF"
+            self._highlight_color = "#00FFFF"
+            self._stroke_color = "#000000"
+            self._stroke_thickness = 3.5
+            self._bg_style = "semi_transparent_black"
+            self._has_bg_box = True
+            self._bg_color = "#000000"
+            self._bg_opacity = 0.75
+            self.combo_bg.blockSignals(True)
+            self.combo_bg.setCurrentIndex(1)  # Semi-Transparent Box
+            self.combo_bg.blockSignals(False)
+            self.combo_font.setCurrentText("Montserrat")
+            self.slider_fs.setValue(58)
+            self._is_bold = True
+            self._is_italic = False
+            self._preset_name = "Viral Shorts (Yellow + Box)"
+        elif idx == 2:  # High-Contrast Box (White + Solid Black)
+            self._font_color = "#FFFFFF"
+            self._highlight_color = "#FFFF00"
+            self._stroke_color = "#000000"
+            self._stroke_thickness = 3.5
             self._bg_style = "solid_black"
             self._has_bg_box = True
+            self._bg_color = "#000000"
             self._bg_opacity = 1.0
             self.combo_bg.blockSignals(True)
-            self.combo_bg.setCurrentIndex(1)
+            self.combo_bg.setCurrentIndex(2)  # Solid Box
             self.combo_bg.blockSignals(False)
             self.combo_font.setCurrentText("Impact")
             self.slider_fs.setValue(54)
-            self._preset_name = "High-Contrast Box (Yellow + Solid Box)"
-        elif idx == 3:  # Cinematic Minimalist
-            self._font_color = "#FFFFFF"
-            self._highlight_color = "#FFFF00"
-            self._bg_style = "semi_transparent_black"
-            self._has_bg_box = True
-            self._bg_opacity = 0.4
+            self._is_bold = True
+            self._is_italic = False
+            self._preset_name = "High-Contrast Box (White + Solid Black)"
+        elif idx == 3:  # Minimal Clean (White + Outline)
+            self._font_color = "#F8FAFC"
+            self._highlight_color = "#38BDF8"
+            self._stroke_color = "#000000"
+            self._stroke_thickness = 2.5
+            self._bg_style = "outline"
+            self._has_bg_box = False
             self.combo_bg.blockSignals(True)
             self.combo_bg.setCurrentIndex(0)
             self.combo_bg.blockSignals(False)
-            self.combo_font.setCurrentText("Segoe UI Bold")
+            self.combo_font.setCurrentText("Poppins")
+            self.slider_fs.setValue(50)
+            self._is_bold = False
+            self._is_italic = False
+            self._preset_name = "Minimal Clean (White + Outline)"
+        elif idx == 4:  # Cinematic Teal
+            self._font_color = "#2DD4BF"
+            self._highlight_color = "#FDE047"
+            self._stroke_color = "#042F2E"
+            self._stroke_thickness = 3.0
+            self._bg_style = "semi_transparent_black"
+            self._has_bg_box = True
+            self._bg_color = "#022C22"
+            self._bg_opacity = 0.70
+            self.combo_bg.blockSignals(True)
+            self.combo_bg.setCurrentIndex(1)
+            self.combo_bg.blockSignals(False)
+            self.combo_font.setCurrentText("Segoe UI")
             self.slider_fs.setValue(52)
-            self._preset_name = "Cinematic Minimalist"
+            self._is_bold = True
+            self._is_italic = False
+            self._preset_name = "Cinematic Teal"
 
-        self.btn_col_swatch.setStyleSheet(f"background-color: {self._font_color}; border: 1.5px solid #334155; border-radius: 6px;")
-        self.btn_hl_swatch.setStyleSheet(f"background-color: {self._highlight_color}; border: 1.5px solid #334155; border-radius: 6px;")
+        self.btn_bold.setStyleSheet(BTN_ACTIVE_STYLE if self._is_bold else BTN_INACTIVE_STYLE)
+        self.btn_italic.setStyleSheet(BTN_ACTIVE_STYLE if self._is_italic else BTN_INACTIVE_STYLE)
+        self.btn_col_swatch.setStyleSheet(f"background-color: {self._font_color}; border: 1.5px solid #334155; border-radius: 5px;")
+        self.btn_hl_swatch.setStyleSheet(f"background-color: {self._highlight_color}; border: 1.5px solid #334155; border-radius: 5px;")
+        self.btn_bg_swatch.setStyleSheet(f"background-color: {self._bg_color}; border: 1.5px solid #334155; border-radius: 5px;")
+        self.btn_stroke_swatch.setStyleSheet(f"background-color: {self._stroke_color}; border: 1.5px solid #334155; border-radius: 5px;")
+        self._update_preview()
+
+    def _apply_preset_color(self, font_c: str, stroke_c: str) -> None:
+        self._font_color = font_c
+        self._stroke_color = stroke_c
+        self.btn_col_swatch.setStyleSheet(f"background-color: {font_c}; border: 1.5px solid #334155; border-radius: 5px;")
+        self.btn_stroke_swatch.setStyleSheet(f"background-color: {stroke_c}; border: 1.5px solid #334155; border-radius: 5px;")
         self._update_preview()
 
     def _on_bg_changed(self, idx: int) -> None:
-        if idx == 0:
+        if idx == 0:  # Outline Mode
+            self._bg_style = "outline"
+            self._has_bg_box = False
+        elif idx == 1:  # Semi-Transparent Box
             self._bg_style = "semi_transparent_black"
             self._has_bg_box = True
-            self._bg_opacity = 0.5
-        elif idx == 1:
+            self._bg_opacity = 0.75
+            if hasattr(self, "combo_box_opacity"):
+                self.combo_box_opacity.setCurrentIndex(0)
+        elif idx == 2:  # Solid Box
             self._bg_style = "solid_black"
             self._has_bg_box = True
             self._bg_opacity = 1.0
-        elif idx == 2:
-            self._bg_style = "outline"
-            self._has_bg_box = False
+            if hasattr(self, "combo_box_opacity"):
+                self.combo_box_opacity.setCurrentIndex(1)
+        elif idx == 3:  # Custom Box
+            self._bg_style = "custom_box"
+            self._has_bg_box = True
+        self._update_preview()
+
+    def _on_opacity_changed(self, idx: int) -> None:
+        opacities = [0.75, 1.0, 0.50]
+        if 0 <= idx < len(opacities):
+            self._bg_opacity = opacities[idx]
+        self._update_preview()
+
+    def _pick_bg_color(self) -> None:
+        c = QColorDialog.getColor(QColor(self._bg_color), self, "Select Background Box Color")
+        if c.isValid():
+            self._bg_color = c.name().upper()
+            self.btn_bg_swatch.setStyleSheet(f"background-color: {self._bg_color}; border: 1.5px solid #334155; border-radius: 6px;")
+            self._update_preview()
+
+    def _pick_stroke_color(self) -> None:
+        c = QColorDialog.getColor(QColor(self._stroke_color), self, "Select Outline Stroke Color")
+        if c.isValid():
+            self._stroke_color = c.name().upper()
+            self.btn_stroke_swatch.setStyleSheet(f"background-color: {self._stroke_color}; border: 1.5px solid #334155; border-radius: 6px;")
+            self._update_preview()
+
+    def _on_box_padding_changed(self, val: int) -> None:
+        self._box_padding = float(val)
+        self.lbl_box_pad_val.setText(f"{val} px")
+        self._update_preview()
+
+    def _on_stroke_changed(self, val: int) -> None:
+        self._stroke_thickness = val * 0.8
+        self.lbl_stroke_val.setText(f"{self._stroke_thickness:.1f} px")
+        self._update_preview()
+
+    def _on_clip_dur_changed(self, val: int) -> None:
+        self._clip_duration = float(val)
+        self.lbl_clip_dur_val.setText(f"{val}.0 s")
+
+    def _on_mix_ratio_changed(self, val: int) -> None:
+        self._image_ratio = float(val) / 100.0
+        self.lbl_mix_ratio_val.setText(f"Images: {val}% | Video Clips: {100 - val}%")
+
+    def _toggle_pattern_btn(self, btn: QPushButton) -> None:
+        if btn is self.btn_bold:
+            self._is_bold = not self._is_bold
+            btn.setStyleSheet(BTN_ACTIVE_STYLE if self._is_bold else BTN_INACTIVE_STYLE)
+        elif btn is self.btn_italic:
+            self._is_italic = not self._is_italic
+            btn.setStyleSheet(BTN_ACTIVE_STYLE if self._is_italic else BTN_INACTIVE_STYLE)
+        elif btn is self.btn_underline:
+            is_active = (btn.styleSheet() == BTN_ACTIVE_STYLE)
+            btn.setStyleSheet(BTN_INACTIVE_STYLE if is_active else BTN_ACTIVE_STYLE)
+        self._update_preview()
+
+    def _set_case(self, case_type: str) -> None:
+        self._font_case = case_type
+        self.btn_case_upper.setStyleSheet(BTN_ACTIVE_STYLE if case_type == "upper" else BTN_INACTIVE_STYLE)
+        self.btn_case_lower.setStyleSheet(BTN_ACTIVE_STYLE if case_type == "lower" else BTN_INACTIVE_STYLE)
+        self.btn_case_title.setStyleSheet(BTN_ACTIVE_STYLE if case_type == "title" else BTN_INACTIVE_STYLE)
         self._update_preview()
 
     def _on_res_changed(self, idx: int) -> None:
@@ -688,6 +1076,18 @@ class BulkView(QWidget):
             self._resolution = "2k"
         else:
             self._resolution = "1080p"
+
+        out_dir = Path(self.edit_output_dir.text().strip()) if self.edit_output_dir.text().strip() else get_config().output_dir
+        for r in range(self.table.rowCount()):
+            audio_item = self.table.item(r, 1)
+            if audio_item:
+                audio_path = Path(audio_item.toolTip()) if audio_item.toolTip() else Path(audio_item.text())
+                safe_stem = audio_path.stem.replace(" ", "_")
+                new_out = out_dir / f"{safe_stem}_{self._resolution}.mp4"
+                out_item = self.table.item(r, 4)
+                if out_item:
+                    out_item.setText(new_out.name)
+                    out_item.setToolTip(str(new_out.resolve()))
 
     def _on_fs_changed(self, val: int) -> None:
         self._font_size = val
@@ -709,20 +1109,56 @@ class BulkView(QWidget):
             self._update_preview()
 
     def _update_preview(self) -> None:
-        font_name = self.combo_font.currentText().split(" ")[0]
-        base_size = max(int(self._font_size * 0.34), 14)
+        raw_font = self.combo_font.currentText().split("(")[0].strip()
+        font_name = raw_font.replace(" Bold", "").strip() or "Montserrat"
+        base_size = max(int(self._font_size * 0.36), 14)
 
-        if self._bg_style == "solid_black":
-            box_style = f"background-color: #000000; color: {self._font_color}; border: 1.5px solid #1E293B; border-radius: 6px; padding: 6px 16px;"
-        elif self._bg_style == "semi_transparent_black":
-            box_style = f"background-color: rgba(0, 0, 0, 0.70); color: {self._font_color}; border: 1px solid rgba(255, 255, 255, 0.20); border-radius: 6px; padding: 6px 16px;"
+        font_weight = "800" if self._is_bold else "normal"
+        font_style = "italic" if self._is_italic else "normal"
+
+        sample_text = "Batch Subtitle Typography Preview"
+        if self._font_case == "upper":
+            sample_text = sample_text.upper()
+        elif self._font_case == "lower":
+            sample_text = sample_text.lower()
+        elif self._font_case == "title":
+            sample_text = sample_text.title()
+
+        self.lbl_preview.setText(sample_text)
+
+        if self._has_bg_box:
+            hex_c = self._bg_color.lstrip("#")
+            if len(hex_c) == 6:
+                try:
+                    r, g, b = int(hex_c[0:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
+                except ValueError:
+                    r, g, b = 0, 0, 0
+            else:
+                r, g, b = 0, 0, 0
+
+            pad_v = max(4, int(self._box_padding * 0.45))
+            pad_h = max(8, int(self._box_padding * 1.1))
+            box_style = (
+                f"background-color: rgba({r}, {g}, {b}, {self._bg_opacity:.2f}); "
+                f"color: {self._font_color}; "
+                f"border: 1px solid rgba(255, 255, 255, 0.20); "
+                f"border-radius: 6px; "
+                f"padding: {pad_v}px {pad_h}px;"
+            )
         else:  # Outline
-            box_style = f"background-color: transparent; color: {self._font_color}; border: 1.5px dashed #334155; border-radius: 6px; padding: 6px 16px;"
+            box_style = (
+                f"background-color: transparent; "
+                f"color: {self._font_color}; "
+                f"border: 1.5px dashed #334155; "
+                f"border-radius: 6px; "
+                f"padding: 6px 16px;"
+            )
 
         self.lbl_preview.setStyleSheet(f"""
             font-family: '{font_name}', 'Segoe UI', Arial, sans-serif;
             font-size: {base_size}px;
-            font-weight: 800;
+            font-weight: {font_weight};
+            font-style: {font_style};
             letter-spacing: 0.5px;
             {box_style}
         """)
@@ -769,11 +1205,21 @@ class BulkView(QWidget):
 
         p = Path(dir_str)
         audio_exts = {".mp3", ".wav", ".m4a", ".flac"}
+        audio_files = [
+            f for f in p.iterdir()
+            if f.is_file() and f.suffix.lower() in audio_exts
+        ]
+        audio_files.sort(key=natural_sort_key)
+
+        limit = self.spin_batch_limit.value() if hasattr(self, "spin_batch_limit") else 0
+        if limit > 0:
+            audio_files = audio_files[:limit]
+
+        self.table.setRowCount(0)
         count = 0
-        for audio_file in sorted(p.iterdir()):
-            if audio_file.is_file() and audio_file.suffix.lower() in audio_exts:
-                self._insert_row(audio_file)
-                count += 1
+        for audio_file in audio_files:
+            self._insert_row(audio_file)
+            count += 1
 
         self._update_badge()
         if count == 0:
@@ -785,34 +1231,58 @@ class BulkView(QWidget):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
-        title = audio_path.stem.replace("_", " ").title()
-
         footage_base = Path(self.edit_footage_dir.text().strip()) if self.edit_footage_dir.text().strip() else get_config().project_root / "assets" / "sample_footage"
-        specific_subfolder = footage_base / audio_path.stem
-        assets_folder = specific_subfolder if specific_subfolder.is_dir() else footage_base
+        matched_folder, scan_summary = CharacterMatcher.find_matching_footage_folder(audio_path, footage_base)
+
+        # Build clean summary label for column 2
+        pools = scan_summary.get("character_pools", {})
+        video_files = scan_summary.get("video_files", [])
+        general_images = scan_summary.get("general_images", 0)
+
+        summary_parts = []
+        if pools:
+            summary_parts.append(f"{len(pools)} pool{'s' if len(pools) > 1 else ''}")
+        if general_images:
+            summary_parts.append(f"{general_images} img{'s' if general_images > 1 else ''}")
+        if video_files:
+            summary_parts.append(f"{len(video_files)} video{'s' if len(video_files) > 1 else ''}")
+
+        summary_suffix = f" ({', '.join(summary_parts)})" if summary_parts else ""
+        folder_display_text = f"{matched_folder.name}{summary_suffix}"
+
+        # Template selection
+        selected_template_label = self.combo_template.currentText()
+        template_short = "Template 1" if "Template 1" in selected_template_label else "Template 2"
+
+        # Output path
+        out_dir = Path(self.edit_output_dir.text().strip()) if self.edit_output_dir.text().strip() else get_config().output_dir
+        safe_stem = audio_path.stem.replace(" ", "_")
+        out_file = out_dir / f"{safe_stem}_{self._resolution}.mp4"
 
         # 0. Job #
         idx_item = QTableWidgetItem(str(row + 1))
         idx_item.setTextAlignment(Qt.AlignCenter)
         self.table.setItem(row, 0, idx_item)
 
-        # 1. Title
-        title_item = QTableWidgetItem(title)
-        self.table.setItem(row, 1, title_item)
-
-        # 2. Audio File
+        # 1. Audio File
         audio_item = QTableWidgetItem(audio_path.name)
-        audio_item.setToolTip(str(audio_path))
-        self.table.setItem(row, 2, audio_item)
+        audio_item.setToolTip(str(audio_path.resolve()))
+        self.table.setItem(row, 1, audio_item)
 
-        # 3. Assets Folder
-        assets_item = QTableWidgetItem(assets_folder.name)
-        assets_item.setToolTip(str(assets_folder))
-        self.table.setItem(row, 3, assets_item)
+        # 2. Matched Footage Folder
+        matched_item = QTableWidgetItem(folder_display_text)
+        matched_item.setToolTip(str(matched_folder.resolve()))
+        self.table.setItem(row, 2, matched_item)
 
-        # 4. Style Preset
-        style_item = QTableWidgetItem(self._preset_name)
-        self.table.setItem(row, 4, style_item)
+        # 3. Template
+        tpl_item = QTableWidgetItem(template_short)
+        tpl_item.setToolTip(selected_template_label)
+        self.table.setItem(row, 3, tpl_item)
+
+        # 4. Output Path
+        out_item = QTableWidgetItem(out_file.name)
+        out_item.setToolTip(str(out_file.resolve()))
+        self.table.setItem(row, 4, out_item)
 
         # 5. Progress Bar
         bar = QProgressBar()
@@ -854,12 +1324,11 @@ class BulkView(QWidget):
 
     def _on_table_double_clicked(self, item: QTableWidgetItem) -> None:
         row = item.row()
-        out_dir = Path(self.edit_output_dir.text().strip())
-        audio_name = self.table.item(row, 2).text()
-        safe_stem = Path(audio_name).stem.replace(" ", "_")
-        out_file = out_dir / f"{safe_stem}_{self._resolution}.mp4"
-        if out_file.exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out_file)))
+        out_item = self.table.item(row, 4)
+        if out_item and out_item.toolTip():
+            out_file = Path(out_item.toolTip())
+            if out_file.exists():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(out_file)))
 
     # ── Queue Execution ────────────────────────────────────────────────────────
 
@@ -874,16 +1343,29 @@ class BulkView(QWidget):
         audio_base = Path(self.edit_audio_dir.text().strip())
         footage_base = Path(self.edit_footage_dir.text().strip())
 
+        limit = self.spin_batch_limit.value() if hasattr(self, "spin_batch_limit") else 0
+        total_rows = self.table.rowCount()
+        rows_to_process = min(total_rows, limit) if limit > 0 else total_rows
+
         jobs: list[BulkJob] = []
-        for r in range(self.table.rowCount()):
-            title = self.table.item(r, 1).text()
-            audio_name = self.table.item(r, 2).text()
-            audio_path = Path(self.table.item(r, 2).toolTip()) if self.table.item(r, 2).toolTip() else audio_base / audio_name
+        for r in range(rows_to_process):
+            audio_item = self.table.item(r, 1)
+            audio_path = Path(audio_item.toolTip()) if (audio_item and audio_item.toolTip()) else Path(audio_item.text())
+            title = audio_path.stem.replace("_", " ").title()
 
-            assets_path = Path(self.table.item(r, 3).toolTip()) if self.table.item(r, 3).toolTip() else footage_base
+            matched_item = self.table.item(r, 2)
+            assets_path = Path(matched_item.toolTip()) if (matched_item and matched_item.toolTip()) else footage_base
 
+            tpl_item = self.table.item(r, 3)
+            tpl_text = tpl_item.text() if tpl_item else "Template 1"
+            tpl_type = "template_2" if "Template 2" in tpl_text else "template_1"
+            tpl_label = tpl_item.toolTip() if (tpl_item and tpl_item.toolTip()) else (
+                "Template 2 (Episode Scene Matching)" if tpl_type == "template_2" else "Template 1 (Hybrid Images & Video Mix)"
+            )
+
+            out_item = self.table.item(r, 4)
             safe_stem = audio_path.stem.replace(" ", "_")
-            out_file = out_dir / f"{safe_stem}_{self._resolution}.mp4"
+            out_file = Path(out_item.toolTip()) if (out_item and out_item.toolTip()) else (out_dir / f"{safe_stem}_{self._resolution}.mp4")
 
             jobs.append(BulkJob(
                 job_id=r,
@@ -891,8 +1373,11 @@ class BulkView(QWidget):
                 audio_path=audio_path,
                 images_dir=assets_path,
                 output_path=out_file,
+                template_type=tpl_type,
+                template_label=tpl_label,
                 resolution=self._resolution,
                 clip_duration=float(self.slider_clip_dur.value()) if hasattr(self, "slider_clip_dur") else 5.0,
+                image_ratio=float(self.slider_mix_ratio.value()) / 100.0 if hasattr(self, "slider_mix_ratio") else 0.5,
                 text_color=self._font_color,
                 highlight_color=self._highlight_color,
                 has_bg_box=self._has_bg_box,
@@ -903,9 +1388,9 @@ class BulkView(QWidget):
                 stroke_thickness=self._stroke_thickness,
                 font_size=self._font_size,
                 font_family=self.combo_font.currentText().split(" ")[0],
-                bold=True,
-                italic=False,
-                box_padding=14.0,
+                bold=self._is_bold,
+                italic=self._is_italic,
+                box_padding=self._box_padding,
                 style_preset_name=self._preset_name,
                 generate_chapters=self.chk_chapters.isChecked(),
                 include_images=self.chk_ken_burns.isChecked(),

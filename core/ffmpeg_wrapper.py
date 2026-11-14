@@ -230,7 +230,6 @@ def _probe_via_ffmpeg_fallback(path: Path) -> MediaInfo:
         errors="replace",
         check=False,
         stdin=subprocess.DEVNULL,
-        close_fds=True,
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
     stderr = result.stderr

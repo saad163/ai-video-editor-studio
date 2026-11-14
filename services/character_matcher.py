@@ -65,6 +65,51 @@ logger = get_logger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Smart Number Extraction & Natural Sorting Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+WORD_TO_NUMBER: dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19, "twenty": 20,
+}
+
+
+def extract_numeric_index(name: str) -> Optional[int]:
+    """
+    Extract a numeric index from a filename or folder name.
+    Supports digits (e.g. 'audio 1', 'audio_02', '10.mp3') and spelled-out words
+    ('one' -> 1, 'video twenty content' -> 20).
+    """
+    clean_stem = Path(name).stem.lower().replace("_", " ").replace("-", " ")
+
+    # 1. Check for explicit numbers
+    match = re.search(r"\b\d+\b", clean_stem)
+    if not match:
+        match = re.search(r"\d+", clean_stem)
+    if match:
+        try:
+            return int(match.group(0))
+        except ValueError:
+            pass
+
+    # 2. Check for spelled-out numbers
+    for token in clean_stem.split():
+        if token in WORD_TO_NUMBER:
+            return WORD_TO_NUMBER[token]
+
+    return None
+
+
+def natural_sort_key(path: Path | str) -> list[int | str]:
+    """Key for natural alphanumeric sorting (audio 1, audio 2, ... audio 10)."""
+    s = Path(path).name.lower()
+    return [int(text) if text.isdigit() else text for text in re.split(r"(\d+)", s)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Data model
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -318,6 +363,41 @@ class CharacterMatcher:
             "video_files": video_files,
             "badge_text": badge_text,
         }
+
+    @classmethod
+    def find_matching_footage_folder(
+        cls, audio_file: Path | str, footage_root: Path | str
+    ) -> tuple[Path, dict[str, Any]]:
+        """
+        Locate the specific content subfolder inside footage_root matching audio_file's numeric index.
+        E.g. 'audio 1.mp3' -> 'video 1 content/' or 'video_1_content/' or 'video one content/'.
+        If no matching numbered subfolder is found, falls back gracefully to footage_root.
+        Returns (matched_path, scan_summary).
+        """
+        audio_p = Path(audio_file)
+        root_p = Path(footage_root).resolve()
+
+        if not root_p.exists() or not root_p.is_dir():
+            return root_p, cls.scan_asset_folder(root_p)
+
+        audio_idx = extract_numeric_index(audio_p.name)
+
+        if audio_idx is not None:
+            candidate_dirs = [d for d in root_p.iterdir() if d.is_dir()]
+            # 1. First priority: exact numeric index match
+            for subdir in candidate_dirs:
+                sub_idx = extract_numeric_index(subdir.name)
+                if sub_idx == audio_idx:
+                    return subdir, cls.scan_asset_folder(subdir)
+
+            # 2. Second priority: substring match on audio stem
+            stem_clean = audio_p.stem.lower().replace("_", " ").strip()
+            for subdir in candidate_dirs:
+                sub_clean = subdir.name.lower().replace("_", " ").strip()
+                if stem_clean in sub_clean or sub_clean in stem_clean:
+                    return subdir, cls.scan_asset_folder(subdir)
+
+        return root_p, cls.scan_asset_folder(root_p)
 
     def assign(
         self,
