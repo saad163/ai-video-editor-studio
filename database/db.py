@@ -157,6 +157,7 @@ CREATE TABLE IF NOT EXISTS interview_candidates_cache (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     video_hash     TEXT    NOT NULL,
     filter_mode    TEXT    NOT NULL DEFAULT 'strict',
+    filter_version TEXT    NOT NULL DEFAULT 'v1',
     segments_json  TEXT    NOT NULL,
     model_used     TEXT    NOT NULL DEFAULT '',
     created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
@@ -165,7 +166,7 @@ CREATE TABLE IF NOT EXISTS interview_candidates_cache (
 
 _DDL_INTERVIEW_CANDIDATES_CACHE_IDX = """
 CREATE INDEX IF NOT EXISTS idx_interview_candidates_cache
-    ON interview_candidates_cache(video_hash, filter_mode);
+    ON interview_candidates_cache(video_hash, filter_mode, filter_version);
 """
 
 _ALL_DDL = [
@@ -242,6 +243,14 @@ def init_db() -> None:
     with get_connection() as conn:
         for statement in _ALL_DDL:
             conn.execute(statement)
+        # Check and migrate filter_version column if missing in older database files
+        try:
+            cursor = conn.execute("PRAGMA table_info(interview_candidates_cache)")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if columns and "filter_version" not in columns:
+                conn.execute("ALTER TABLE interview_candidates_cache ADD COLUMN filter_version TEXT NOT NULL DEFAULT 'v1'")
+        except Exception as exc:
+            logger.debug("Migration check for interview_candidates_cache: %s", exc)
         conn.commit()
 
     logger.info("Database ready.")
@@ -407,17 +416,19 @@ def insert_scene_match_cache(
 def get_cached_interview_candidates(
     video_hash: str,
     filter_mode: str = "strict",
+    filter_version: str = "v2_strict_twoperson",
 ) -> sqlite3.Row | None:
     """
-    Fetch cached interview segment candidates for given video hash and filter mode.
-    Keyed properly by (video_hash + filter_mode) so toggling strict/relax returns accurate results.
+    Fetch cached interview segment candidates for given video hash, filter mode, and filter version.
+    Keyed properly by (video_hash + filter_mode + filter_version) so changing filter version
+    automatically invalidates older looser cache entries without dropping database.
     """
     with get_connection() as conn:
         return conn.execute(
             """SELECT * FROM interview_candidates_cache
-               WHERE video_hash = ? AND filter_mode = ?
+               WHERE video_hash = ? AND filter_mode = ? AND filter_version = ?
                ORDER BY created_at DESC LIMIT 1""",
-            (video_hash, filter_mode),
+            (video_hash, filter_mode, filter_version),
         ).fetchone()
 
 
@@ -426,14 +437,15 @@ def insert_interview_candidates_cache(
     segments_json: str,
     filter_mode: str = "strict",
     model_used: str = "",
+    filter_version: str = "v2_strict_twoperson",
 ) -> int:
-    """Store scanned interview candidate segments in persistent SQLite cache."""
+    """Store scanned interview candidate segments in persistent SQLite cache with filter versioning."""
     with get_connection() as conn:
         cur = conn.execute(
             """INSERT INTO interview_candidates_cache
-               (video_hash, filter_mode, segments_json, model_used)
-               VALUES (?, ?, ?, ?)""",
-            (video_hash, filter_mode, segments_json, model_used),
+               (video_hash, filter_mode, filter_version, segments_json, model_used)
+               VALUES (?, ?, ?, ?, ?)""",
+            (video_hash, filter_mode, filter_version, segments_json, model_used),
         )
         conn.commit()
         return cur.lastrowid  # type: ignore[return-value]

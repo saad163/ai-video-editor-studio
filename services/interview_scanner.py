@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -29,6 +30,53 @@ from utils.config import get_config
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+INTERVIEW_FILTER_VERSION = "v2_strict_twoperson"
+
+
+def extract_video_frame(video_path: Path, timestamp_sec: float) -> Optional["np.ndarray"]:
+    """
+    Extract a single BGR video frame at timestamp_sec.
+    Tries OpenCV seek first; falls back cleanly to FFmpeg pipe for AV1 / 60fps files
+    where OpenCV native demuxing may fail to seek accurately.
+    """
+    import cv2
+    import numpy as np
+    from core.ffmpeg_wrapper import _ff
+
+    # 1. OpenCV attempt
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(max(0.0, timestamp_sec) * 1000.0))
+            ret, frame = cap.read()
+            cap.release()
+            if ret and frame is not None and frame.size > 0:
+                return frame
+    except Exception as exc:
+        logger.debug("OpenCV frame extract fallback on %s at %.2fs: %s", video_path.name, timestamp_sec, exc)
+
+    # 2. FFmpeg image2pipe fallback (100% reliable for AV1 / av01 / 60fps files)
+    try:
+        cmd = [
+            _ff(),
+            "-ss", f"{timestamp_sec:.3f}",
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-vf", "scale=320:180",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-v", "quiet",
+            "-",
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8)
+        if proc.returncode == 0 and len(proc.stdout) == (320 * 180 * 3):
+            return np.frombuffer(proc.stdout, dtype=np.uint8).reshape((180, 320, 3))
+    except Exception as exc:
+        logger.debug("FFmpeg frame extract failed on %s: %s", video_path.name, exc)
+
+    return None
 
 
 @dataclass
@@ -230,10 +278,14 @@ class InterviewScanner:
         from utils.file_helpers import compute_file_hash
         video_hash = compute_file_hash(video_path)
 
-        # Step 1.5: Check SQLite cache
+        # Step 1.5: Check SQLite cache (strictly keyed by video_hash, filter_mode, and filter_version)
         if use_cache:
             from database.db import get_cached_interview_candidates
-            cached_row = get_cached_interview_candidates(video_hash=video_hash, filter_mode=filter_mode)
+            cached_row = get_cached_interview_candidates(
+                video_hash=video_hash,
+                filter_mode=filter_mode,
+                filter_version=INTERVIEW_FILTER_VERSION,
+            )
             if cached_row and cached_row["segments_json"]:
                 try:
                     data = json.loads(cached_row["segments_json"])
@@ -255,9 +307,10 @@ class InterviewScanner:
                             for item in data
                         ]
                         logger.info(
-                            "Cache hit for interview video '%s' (mode=%s) — loaded %d segment(s) from SQLite.",
+                            "Cache hit for interview video '%s' (mode=%s, ver=%s) — loaded %d segment(s) from SQLite.",
                             video_path.name,
                             filter_mode,
+                            INTERVIEW_FILTER_VERSION,
                             len(cached_segments),
                         )
                         if progress_cb:
@@ -291,7 +344,7 @@ class InterviewScanner:
             progress_cb=progress_cb,
         )
 
-        # Step 5: Save to SQLite cache
+        # Step 5: Save to SQLite cache (keyed with filter_version)
         if use_cache:
             try:
                 from database.db import insert_interview_candidates_cache
@@ -316,6 +369,7 @@ class InterviewScanner:
                     segments_json=json.dumps(cache_payload, ensure_ascii=False),
                     filter_mode=filter_mode,
                     model_used="gemini+cv_verifier",
+                    filter_version=INTERVIEW_FILTER_VERSION,
                 )
             except Exception as exc:
                 logger.warning("Failed saving interview candidates to SQLite cache: %s", exc)
@@ -333,73 +387,81 @@ class InterviewScanner:
         progress_cb: Optional[Callable[[int, str], None]] = None,
     ) -> list[InterviewSegment]:
         """
-        Sample key frames from each detected candidate segment and score interview-style framing.
-        In strict mode, filters out non-human / B-roll / scenery cuts.
-        In all/relaxed mode, retains all segments with framing scores attached.
+        Sample key frames across candidate segments and score interview-style framing.
+        In strict mode:
+          - Prioritizes/requires man-to-man / two-person interview framing or single interview speaker.
+          - Rejects non-human B-roll, distant landscape, crowd, slides, and unrelated non-interview footage.
+        In all/relaxed mode:
+          - Retains all segments with attached interview framing scores.
         """
         if not segments or not video_path.is_file():
             return list(segments)
 
         from services.scene_detector import evaluate_interview_framing
-        import cv2
 
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            logger.warning("Could not open video file %s for interview frame verification", video_path)
-            return list(segments)
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         verified: list[InterviewSegment] = []
 
-        try:
-            for idx, seg in enumerate(segments):
-                if progress_cb:
-                    pct = 85 + int((idx / max(1, len(segments))) * 13)
-                    progress_cb(pct, f"Verifying interview framing for clip #{seg.segment_id}...")
+        for idx, seg in enumerate(segments):
+            if progress_cb:
+                pct = 85 + int((idx / max(1, len(segments))) * 13)
+                progress_cb(pct, f"Verifying interview framing for clip #{seg.segment_id}...")
 
-                # Sample up to 2 frames per segment (at 25% and 60% of duration)
-                mid_s1 = seg.start_sec + (seg.duration_sec * 0.25)
-                mid_s2 = seg.start_sec + (seg.duration_sec * 0.60)
-                frame_scores = []
+            # Sample 3 frames across segment duration: 20%, 50%, 80%
+            s1 = seg.start_sec + (seg.duration_sec * 0.20)
+            s2 = seg.start_sec + (seg.duration_sec * 0.50)
+            s3 = seg.start_sec + (seg.duration_sec * 0.80)
+            frame_scores = []
 
-                for sample_s in (mid_s1, mid_s2):
-                    frame_num = int(sample_s * fps)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
-                        res = evaluate_interview_framing(frame)
-                        frame_scores.append(res)
+            for sample_s in (s1, s2, s3):
+                frame = extract_video_frame(video_path, sample_s)
+                if frame is not None:
+                    res = evaluate_interview_framing(frame)
+                    frame_scores.append(res)
 
-                if frame_scores:
-                    max_score = max(f["score"] for f in frame_scores)
-                    has_human = any(f["is_interview"] or f["score"] >= 0.38 for f in frame_scores)
-                else:
-                    max_score = 1.0
-                    has_human = True
+            if frame_scores:
+                max_score = max(f["score"] for f in frame_scores)
+                has_two_person = any(f.get("is_two_person", False) for f in frame_scores)
+                has_speaker = any(f.get("is_speaker", False) or f.get("face_count", 0) >= 1 for f in frame_scores)
+                has_human = any(f.get("is_interview", False) or f.get("score", 0.0) >= 0.40 for f in frame_scores)
+            else:
+                max_score = 1.0
+                has_two_person = False
+                has_speaker = True
+                has_human = True
 
-                seg.interview_score = round(float(max_score), 3)
-                seg.is_human_verified = bool(has_human)
+            seg.interview_score = round(float(max_score), 3)
+            seg.is_human_verified = bool(has_human)
 
-                if filter_mode == "strict":
-                    if has_human or max_score >= 0.38:
-                        verified.append(seg)
-                    else:
-                        logger.info(
-                            "Filtering out non-interview candidate #%d ('%s') score=%.2f (no human interview framing)",
-                            seg.segment_id,
-                            seg.label,
-                            max_score,
-                        )
-                else:
-                    # In "all" mode, keep everything
+            # If two-person / man-to-man framing was detected and speaker is default, enrich speaker label
+            if has_two_person and seg.speaker in ("Speaker", "Guest"):
+                seg.speaker = "Two-Person Dialogue"
+
+            if filter_mode == "strict":
+                # Strict mode: Requires verified interview speaker or two-person interview framing
+                # Non-interview clips (scenery, graphics, slides, non-human b-roll) are rejected
+                if (has_human or has_speaker or has_two_person) and max_score >= 0.38:
                     verified.append(seg)
-        finally:
-            cap.release()
+                else:
+                    logger.info(
+                        "Strict interview filter rejected candidate #%d ('%s') score=%.2f (lacks human/interview subject)",
+                        seg.segment_id,
+                        seg.label,
+                        max_score,
+                    )
+            else:
+                # In "all" mode, retain all segments
+                verified.append(seg)
 
         # Safe empty handling: If strict filtering eliminated every segment, log warning and preserve all
         if not verified and segments:
             logger.warning("Strict interview filter produced 0 clips; falling back to all candidate segments.")
             return list(segments)
+
+        # Re-number segment IDs sequentially
+        for new_id, seg in enumerate(verified, start=1):
+            seg.segment_id = new_id
+
+        return verified
 
         # Re-number segment IDs sequentially
         for new_id, seg in enumerate(verified, start=1):

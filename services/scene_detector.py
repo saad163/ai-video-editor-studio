@@ -135,24 +135,42 @@ def evaluate_interview_framing(frame_bgr: "cv2.typing.MatLike | np.ndarray", rem
     else:
         human_coverage = min(0.65, face_coverage * 3.5)
 
-    # 4. Composite Interview Framing Score
+    # 4. Composite Interview Framing Score (Prioritizing Man-to-Man / Two-Person & Speaker Framing)
     score = 0.0
     is_interview = False
+    is_two_person = False
+    is_speaker = False
 
-    if face_count >= 1:
-        # 1-person close-up/medium shot or 2-person host/guest setup
-        face_score = min(1.0, face_coverage / 0.03) * 0.45
+    if face_count >= 2:
+        # Strict two-person / man-to-man interview framing (host and guest, dialogue exchange)
+        is_two_person = True
+        is_speaker = True
+        is_interview = True
+        face_score = min(0.50, (face_coverage / 0.04) * 0.50)
+        pos_score = 0.30 if any(f["center"][1] <= int(eval_h * 0.80) for f in face_candidates) else 0.15
+        body_score = min(0.20, (human_coverage / 0.20) * 0.20)
+        score = min(1.0, 0.40 + face_score + pos_score + body_score)
+    elif face_count == 1:
+        # Genuine single interview speaker / talking head
+        is_speaker = True
+        face_score = min(0.45, (face_coverage / 0.03) * 0.45)
         pos_score = 0.25 if all(f["center"][1] <= int(eval_h * 0.75) for f in face_candidates) else 0.10
-        body_score = min(1.0, human_coverage / 0.15) * 0.30 if human_coverage > 0 else 0.15
+        body_score = min(0.30, (human_coverage / 0.15) * 0.30) if human_coverage > 0 else 0.15
         score = face_score + pos_score + body_score
         is_interview = bool(score >= 0.38 and face_coverage >= 0.007)
-    elif human_coverage >= 0.12:
-        # Person visible (e.g. turned head or side profile)
-        score = min(0.65, human_coverage * 2.0)
+    elif human_coverage >= 0.15:
+        # Human subject clearly visible (e.g. side angle or turned head)
+        score = min(0.65, human_coverage * 2.2)
         is_interview = bool(score >= 0.42)
+    else:
+        # Pure scenery, distant landscape, crowd, slides or B-roll without clear human presence
+        score = 0.0
+        is_interview = False
 
     return {
         "is_interview": is_interview,
+        "is_two_person": is_two_person,
+        "is_speaker": is_speaker,
         "score": round(float(score), 3),
         "face_count": face_count,
         "face_coverage": round(float(face_coverage), 4),

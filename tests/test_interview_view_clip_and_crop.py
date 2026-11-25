@@ -560,6 +560,48 @@ def test_interview_compiler_person_segmentation_compositing(mock_video_file, tmp
     assert "boxblur=20" in cmd_str
     assert "overlay=" in cmd_str
 
+    # AV1 / 60fps seek compatibility flag
+    assert "-avoid_negative_ts make_zero" in cmd_str
+
+
+def test_screen_area_selection_immediate_cut_and_clamped_crop(qtbot):
+    """
+    Verify screen area selection on CropOverlayWidget immediately cuts outside frame,
+    updates crop coordinates, and maps to exact clamped even pixel dimensions for libx264.
+    """
+    overlay = CropOverlayWidget()
+    overlay.set_source_dimensions(1920, 1080)
+    overlay.resize(640, 360)
+    qtbot.addWidget(overlay)
+    overlay.show()
+
+    # Initially full frame
+    assert overlay.get_crop() == (0, 0, 0, 0)
+    assert build_crop_filter(1920, 1080, 0, 0, 0, 0) == ""
+
+    # User defines a screen area selection: left=120, right=100, top=60, bottom=80
+    overlay.set_crop(top=60, bottom=80, left=120, right=100)
+    t, b, l, r = overlay.get_crop()
+    assert (t, b, l, r) == (60, 80, 120, 100)
+
+    # 1920 - 120 - 100 = 1700 (even)
+    # 1080 - 60 - 80 = 940 (even)
+    filt = build_crop_filter(1920, 1080, crop_top=t, crop_bottom=b, crop_left=l, crop_right=r)
+    assert filt == "crop=1700:940:120:60"
+
+    # Verify paintEvent executes cleanly and renders opaque cut regions without exception
+    overlay.update()
+    overlay.repaint()
+
+    # Verify normalized coordinate conversion is consistent
+    nx, ny, nw, nh = overlay.get_normalized_crop()
+    assert 0.0 <= nx < 1.0
+    assert 0.0 <= ny < 1.0
+    assert 0.0 < nw <= 1.0
+    assert 0.0 < nh <= 1.0
+    assert round(nx + nw, 2) <= 1.0
+    assert round(ny + nh, 2) <= 1.0
+
 
 def test_dialog_framing_presets_and_unclipped_layout(qtbot, sample_segments):
     """Verify quick framing preset buttons and unclipped dimensions in crop studio dialog."""

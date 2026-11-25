@@ -156,8 +156,8 @@ def test_interview_scanner_strict_vs_all_modes():
     call_count = [0]
     def _read_frame():
         call_count[0] += 1
-        # Calls 1 & 2 for seg1, Calls 3 & 4 for seg2
-        if call_count[0] <= 2:
+        # Calls 1..3 for seg1, Calls 4..6 for seg2
+        if call_count[0] <= 3:
             return True, person_frame
         return True, scenery_frame
 
@@ -183,6 +183,70 @@ def test_interview_scanner_strict_vs_all_modes():
             filter_mode="all",
         )
         assert len(verified_all) == 2
+
+
+def test_strict_twoperson_dialogue_classification():
+    """Verify that a 2-person (man-to-man / host-guest) interview frame is detected and tagged."""
+    interview_2p = np.zeros((360, 640, 3), dtype=np.uint8)
+    interview_2p[:] = [30, 30, 35]
+    # Host on left
+    cv2.rectangle(interview_2p, (80, 190), (260, 360), (180, 80, 40), -1)
+    cv2.ellipse(interview_2p, (170, 140), (50, 70), 0, 0, 360, (140, 170, 220), -1)
+    # Guest on right
+    cv2.rectangle(interview_2p, (380, 190), (560, 360), (60, 60, 150), -1)
+    cv2.ellipse(interview_2p, (470, 140), (50, 70), 0, 0, 360, (140, 170, 220), -1)
+
+    res = evaluate_interview_framing(interview_2p)
+    assert res["is_interview"] is True
+    assert res["is_two_person"] is True
+    assert res["face_count"] >= 2
+    assert res["score"] >= 0.70
+
+    # Test segment tagging in InterviewScanner
+    scanner = InterviewScanner(api_key="mock_key")
+    seg = InterviewSegment(1, 0.0, 20.0, 20.0, "00:00", "00:20", "Two-Person Interview Exchange")
+
+    with patch("services.interview_scanner.extract_video_frame", return_value=interview_2p), \
+         patch("pathlib.Path.is_file", return_value=True):
+        verified = scanner._verify_segments_framing(
+            video_path=Path("interview.mp4"),
+            segments=[seg],
+            filter_mode="strict",
+        )
+        assert len(verified) == 1
+        assert verified[0].speaker == "Two-Person Dialogue"
+        assert verified[0].interview_score >= 0.70
+
+
+def test_sqlite_cache_versioning_invalidation():
+    """Verify that upgrading filter_version invalidates older looser cache entries."""
+    import uuid
+    video_hash = f"version_inval_{uuid.uuid4().hex[:10]}"
+
+    # Insert older v1 cache entry
+    insert_interview_candidates_cache(
+        video_hash=video_hash,
+        segments_json=json.dumps([{"segment_id": 1, "start_sec": 0.0, "end_sec": 10.0, "duration_sec": 10.0, "start_time": "00:00", "end_time": "00:10", "label": "Old Cache"}]),
+        filter_mode="strict",
+        filter_version="v1",
+    )
+
+    # Query with default v2_strict_twoperson should return None (stale cache invalidated)
+    stale = get_cached_interview_candidates(video_hash=video_hash, filter_mode="strict", filter_version="v2_strict_twoperson")
+    assert stale is None
+
+    # Insert with current v2_strict_twoperson
+    insert_interview_candidates_cache(
+        video_hash=video_hash,
+        segments_json=json.dumps([{"segment_id": 1, "start_sec": 0.0, "end_sec": 10.0, "duration_sec": 10.0, "start_time": "00:00", "end_time": "00:10", "label": "Fresh v2 Strict"}]),
+        filter_mode="strict",
+        filter_version="v2_strict_twoperson",
+    )
+
+    fresh = get_cached_interview_candidates(video_hash=video_hash, filter_mode="strict", filter_version="v2_strict_twoperson")
+    assert fresh is not None
+    data = json.loads(fresh["segments_json"])
+    assert data[0]["label"] == "Fresh v2 Strict"
 
 
 def test_interview_candidates_sqlite_cache():

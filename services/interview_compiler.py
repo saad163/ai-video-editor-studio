@@ -711,6 +711,7 @@ class InterviewCompiler:
             "-filter_complex", filter_complex,
             "-map", "[vout]",
             "-t", f"{dur:.3f}",
+            "-avoid_negative_ts", "make_zero",
             *enc,
             "-r", str(OUTPUT_FPS),
             "-an",  # Audio will be combined cleanly in the master audio assembly pass

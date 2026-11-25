@@ -424,29 +424,32 @@ class CropOverlayWidget(QWidget):
         vr = self.get_video_rect()
         cr = self.get_crop_screen_rect()
 
-        # Dimmed mask on areas outside crop rectangle
-        dim_color = QColor(0, 0, 0, 160)
+        is_cropped = (self.crop_top > 0 or self.crop_bottom > 0 or self.crop_left > 0 or self.crop_right > 0)
+
+        # Opaque cut matte on areas outside crop rectangle:
+        # Ensures only the selected screen area is visible and outside is immediately cut away
+        cut_color = QColor(6, 6, 10, 248) if is_cropped else QColor(0, 0, 0, 0)
         # Top mask
         if cr.top() > vr.top():
-            p.fillRect(QRect(vr.left(), vr.top(), vr.width(), cr.top() - vr.top()), dim_color)
+            p.fillRect(QRect(vr.left(), vr.top(), vr.width(), cr.top() - vr.top()), cut_color)
         # Bottom mask
         if cr.bottom() < vr.bottom():
-            p.fillRect(QRect(vr.left(), cr.bottom(), vr.width(), vr.bottom() - cr.bottom()), dim_color)
+            p.fillRect(QRect(vr.left(), cr.bottom(), vr.width(), vr.bottom() - cr.bottom()), cut_color)
         # Left mask
         if cr.left() > vr.left():
-            p.fillRect(QRect(vr.left(), cr.top(), cr.left() - vr.left(), cr.height()), dim_color)
+            p.fillRect(QRect(vr.left(), cr.top(), cr.left() - vr.left(), cr.height()), cut_color)
         # Right mask
         if cr.right() < vr.right():
-            p.fillRect(QRect(cr.right(), cr.top(), vr.right() - cr.right(), cr.height()), dim_color)
+            p.fillRect(QRect(cr.right(), cr.top(), vr.right() - cr.right(), cr.height()), cut_color)
 
         # Draw Crop Rectangle Border
-        border_pen = QPen(QColor("#FB923C"), 2, Qt.SolidLine)
+        border_pen = QPen(QColor("#38BDF8") if is_cropped else QColor("#FB923C"), 2, Qt.SolidLine)
         p.setPen(border_pen)
         p.setBrush(Qt.NoBrush)
         p.drawRect(cr)
 
-        # Draw Rule-of-Thirds Guide Lines (subtle dashed white/grey lines inside crop box)
-        guide_pen = QPen(QColor(255, 255, 255, 55), 1, Qt.DashLine)
+        # Draw Rule-of-Thirds Guide Lines (subtle dashed guide lines inside crop box)
+        guide_pen = QPen(QColor(255, 255, 255, 45), 1, Qt.DashLine)
         p.setPen(guide_pen)
         w3 = cr.width() / 3.0
         h3 = cr.height() / 3.0
@@ -458,7 +461,7 @@ class CropOverlayWidget(QWidget):
         # Draw 8 Grab Handles
         handle_size = self.HANDLE_SIZE
         hs2 = handle_size // 2
-        handle_brush = QBrush(QColor("#FB923C"))
+        handle_brush = QBrush(QColor("#38BDF8") if is_cropped else QColor("#FB923C"))
         handle_pen = QPen(QColor("#FFFFFF"), 1.5)
         p.setPen(handle_pen)
         p.setBrush(handle_brush)
@@ -479,8 +482,7 @@ class CropOverlayWidget(QWidget):
         # Draw Dimension & Mode Pill
         cw = max(64, self.source_width - self.crop_left - self.crop_right)
         ch = max(64, self.source_height - self.crop_top - self.crop_bottom)
-        is_cropped = (self.crop_top > 0 or self.crop_bottom > 0 or self.crop_left > 0 or self.crop_right > 0)
-        pill_text = f"✂ Interview Screen Keep Area: {cw} × {ch}" if is_cropped else f"Full Frame: {cw} × {ch}"
+        pill_text = f"✂ KEPT SCREEN AREA: {cw} × {ch} (OUTSIDE CUT)" if is_cropped else f"Full Frame: {cw} × {ch}"
         p.setFont(QFont("Segoe UI", 9, QFont.Bold))
         text_rect = p.fontMetrics().boundingRect(pill_text)
         pill_w = text_rect.width() + 20
@@ -491,10 +493,10 @@ class CropOverlayWidget(QWidget):
             pill_y = cr.top() + 6
 
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(18, 18, 22, 230))
+        p.setBrush(QColor(18, 18, 22, 235))
         p.drawRoundedRect(pill_x, pill_y, pill_w, pill_h, 5, 5)
 
-        p.setPen(QColor("#FB923C") if is_cropped else QColor("#34D399"))
+        p.setPen(QColor("#38BDF8") if is_cropped else QColor("#34D399"))
         p.drawText(QRect(pill_x, pill_y, pill_w, pill_h), Qt.AlignCenter, pill_text)
         p.end()
 
