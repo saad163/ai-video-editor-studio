@@ -227,17 +227,129 @@ class CharacterMatcher:
 
     GENERAL_POOL = "general"
 
-    def __init__(self, images_dir: Path, shuffle: bool = False) -> None:
+    def __init__(
+        self,
+        images_dir: Path,
+        shuffle: bool = False,
+        image_semantics: Optional[dict[Path, Any]] = None,
+    ) -> None:
         self.images_dir = Path(images_dir).resolve()
         self._shuffle = shuffle
         self._pools: dict[str, _ImagePool] = {}
         self._all_images: list[Path] = []   # fallback: every image found
         self._root_videos: list[Path] = []
+        self._image_semantics: dict[Path, Any] = dict(image_semantics) if image_semantics else {}
 
         if self.images_dir.exists():
             self._scan_directory()
         else:
             logger.warning("images_dir does not exist: %s", self.images_dir)
+
+    def set_image_semantics(self, semantics: dict[Path, Any]) -> None:
+        """Inject pre-indexed image semantics (tags, description) into the matcher."""
+        self._image_semantics.update(semantics)
+
+    def _get_image_score(self, img_path: Path, narration_text: str, character_hint: Optional[str] = None) -> float:
+        """Score a candidate image against spoken voiceover text using cached/indexed semantics."""
+        if not narration_text:
+            return 0.0
+        from services.image_semantic_matcher import score_image_semantics, ImageSemantics
+        sem = self._image_semantics.get(img_path)
+        if sem is None:
+            # Check SQLite cache directly
+            try:
+                from database.db import get_cached_image_semantics
+                from utils.file_helpers import compute_file_hash
+                f_hash = compute_file_hash(img_path)
+                cached = get_cached_image_semantics(f_hash)
+                if cached:
+                    sem = ImageSemantics(
+                        file_hash=f_hash,
+                        file_path=img_path,
+                        character_pool=cached.get("character_pool", ""),
+                        tags=cached.get("tags", []),
+                        description=cached.get("description", ""),
+                        is_cached=True,
+                    )
+                    self._image_semantics[img_path] = sem
+            except Exception:
+                pass
+
+        if sem is None:
+            from services.image_semantic_matcher import extract_keywords_from_filename
+            sem = ImageSemantics(
+                file_hash="",
+                file_path=img_path,
+                character_pool=character_hint or "general",
+                tags=extract_keywords_from_filename(img_path),
+                description=f"Image of {img_path.stem}",
+            )
+            self._image_semantics[img_path] = sem
+
+        return score_image_semantics(sem, narration_text, character_hint=character_hint)
+
+    def select_best_image_for_text(
+        self,
+        character: str,
+        narration_text: str,
+        used_images: Optional[set[Path]] = None,
+        last_image: Optional[Path] = None,
+    ) -> Optional[Path]:
+        """
+        Select the most semantically relevant image within the character pool
+        that aligns with what the narrator is saying in `narration_text`.
+        """
+        if used_images is None:
+            used_images = set()
+
+        pool = self._resolve_pool(character)
+        candidates: list[Path] = []
+        if pool and pool._images:
+            candidates = list(pool._images)
+        elif self.GENERAL_POOL in self._pools and self._pools[self.GENERAL_POOL]._images:
+            candidates = list(self._pools[self.GENERAL_POOL]._images)
+        elif self._all_images:
+            candidates = list(self._all_images)
+
+        if not candidates:
+            return None
+
+        valid_candidates = [img for img in candidates if img != last_image] if len(candidates) > 1 else list(candidates)
+
+        if narration_text:
+            scored = [
+                (img, self._get_image_score(img, narration_text, character_hint=character))
+                for img in valid_candidates
+            ]
+            scored.sort(key=lambda pair: pair[1], reverse=True)
+
+            # If there is a meaningful semantic match
+            if scored and scored[0][1] > 0.0:
+                unused = [img for img, sc in scored if sc > 0.0 and img not in used_images]
+                if unused:
+                    chosen = unused[0]
+                    used_images.add(chosen)
+                    return chosen
+                chosen = scored[0][0]
+                used_images.add(chosen)
+                return chosen
+
+        # Fallback to round-robin from pool
+        if pool is not None:
+            chosen = pool.next_image(global_last=last_image)
+            if chosen:
+                used_images.add(chosen)
+                return chosen
+
+        chosen = self._pick_global_fallback(last_image)
+        if chosen:
+            used_images.add(chosen)
+            return chosen
+
+        chosen = candidates[0]
+        used_images.add(chosen)
+        return chosen
+
 
     # ── Directory scanning ─────────────────────────────────────────────────────
 
@@ -300,14 +412,16 @@ class CharacterMatcher:
         return list(self._root_videos)
 
     @classmethod
-    def scan_asset_folder(cls, folder: Path | str) -> dict[str, Any]:
+    def scan_asset_folder(cls, folder: Path | str, template_type: str = "template_1") -> dict[str, Any]:
         """
-        Scan a unified asset directory and return summary counts and formatted badge text.
+        Scan a unified asset directory and return summary counts and formatted badge text
+        tailored for either Template 1 (Hybrid Images & Video) or Template 2 (Episode Scene Matching).
         """
         p = Path(folder).resolve()
         if not p.exists() or not p.is_dir():
             return {
                 "character_pools": {},
+                "character_folders_count": 0,
                 "general_images": 0,
                 "total_images": 0,
                 "video_files": [],
@@ -322,6 +436,9 @@ class CharacterMatcher:
         try:
             for item in sorted(p.iterdir()):
                 if item.is_dir():
+                    # Skip auto-generated export directory
+                    if item.name.lower() == "export":
+                        continue
                     imgs = [
                         f for f in item.iterdir()
                         if f.is_file() and f.suffix.lower() in SUPPORTED_IMAGE_EXTS
@@ -329,6 +446,12 @@ class CharacterMatcher:
                     if imgs:
                         pools[item.name] = len(imgs)
                         total_images += len(imgs)
+                    # Also collect video files inside subfolders (for B-Roll or episode chapters)
+                    vids = [
+                        f for f in item.iterdir()
+                        if f.is_file() and f.suffix.lower() in SUPPORTED_VIDEO_EXTS
+                    ]
+                    video_files.extend(vids)
                 elif item.is_file():
                     ext = item.suffix.lower()
                     if ext in SUPPORTED_IMAGE_EXTS:
@@ -339,25 +462,31 @@ class CharacterMatcher:
         except Exception as exc:
             logger.warning("Error scanning asset folder %s: %s", p, exc)
 
-        parts: list[str] = []
-        if pools:
-            names_summary = ", ".join(pools.keys())
-            if len(names_summary) > 28:
-                names_summary = f"{len(pools)} Characters"
-            parts.append(f"{len(pools)} Character Pool{'s' if len(pools) > 1 else ''} ({names_summary} — {sum(pools.values())} images)")
-        if general_count > 0:
-            parts.append(f"{general_count} General Image{'s' if general_count > 1 else ''}")
-        if video_files:
-            v_label = f"{len(video_files)} Raw Video File{'s' if len(video_files) > 1 else ''}"
-            parts.append(v_label)
+        is_t2 = ("template_2" in template_type.lower() or "episode" in template_type.lower())
 
-        if parts:
-            badge_text = "✓ Detected: " + " + ".join(parts)
+        if is_t2:
+            num_vids = len(video_files)
+            if num_vids > 0:
+                s_suffix = "s" if num_vids != 1 else ""
+                badge_text = f"🎬 Episode Source Detected: {num_vids} Movie File{s_suffix} Ready"
+            else:
+                badge_text = "⚠️ No episode video files (.mp4/.mov/.mkv) found in folder"
         else:
-            badge_text = "⚠️ No visual assets found in folder"
+            # Template 1
+            n_char = len(pools)
+            n_img = total_images
+            n_vid = len(video_files)
+            if n_img > 0 or n_vid > 0:
+                char_str = f"{n_char} Character Folder{'s' if n_char != 1 else ''}"
+                img_str = f"{n_img} Images"
+                vid_str = f"{n_vid} B-Roll clip{'s' if n_vid != 1 else ''}"
+                badge_text = f"📁 Assets Detected: {char_str}, {img_str}, {vid_str}"
+            else:
+                badge_text = "⚠️ No visual assets found in folder"
 
         return {
             "character_pools": pools,
+            "character_folders_count": len(pools),
             "general_images": general_count,
             "total_images": total_images,
             "video_files": video_files,
@@ -493,24 +622,16 @@ class CharacterMatcher:
         assignments: list[SegmentAssignment] = []
         global_last_image: Optional[Path] = None
         last_preset: Optional[KenBurnsPreset] = None
+        used_images: set[Path] = set()
 
         for idx, (seg, char_name) in enumerate(zip(segments, character_assignments)):
-            # Resolve pool
-            pool = self._resolve_pool(char_name)
-            image = None
-
-            if pool is not None:
-                image = pool.next_image(global_last=global_last_image)
-
-            # Fallback chain: general → all_images → first image
-            if image is None:
-                gen_pool = self._pools.get(self.GENERAL_POOL)
-                if gen_pool:
-                    image = gen_pool.next_image(global_last=global_last_image)
-
-            if image is None and self._all_images:
-                # Absolute fallback: pick least-recently-used from entire corpus
-                image = self._pick_global_fallback(global_last_image)
+            # Select best image using semantic matching on spoken segment text
+            image = self.select_best_image_for_text(
+                character=char_name,
+                narration_text=seg.text,
+                used_images=used_images,
+                last_image=global_last_image,
+            )
 
             if image is None:
                 logger.error("No images available for segment %d! Skipping.", idx)

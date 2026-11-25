@@ -183,11 +183,27 @@ class BulkView(QWidget):
             QComboBox:hover { border-color: #818CF8; }
         """)
 
+        self.combo_template.currentIndexChanged.connect(self._update_template_status_badge)
+
         tpl_desc = QLabel("Select rendering workflow: Template 1 mixes Ken Burns images and video b-roll clips, while Template 2 performs smart scene-matching across episode footage.")
         tpl_desc.setStyleSheet("font-size: 11px; color: #94A3B8;")
 
+        self.lbl_gemini_status = QLabel()
+        self.lbl_gemini_status.setWordWrap(True)
+
+        self.btn_api_dashboard = QPushButton("View API Dashboard ↗")
+        self.btn_api_dashboard.setObjectName("secondaryButton")
+        self.btn_api_dashboard.setFixedHeight(24)
+        self.btn_api_dashboard.setStyleSheet("font-size: 10px; color: #38BDF8; border: 1px solid #0369A1; background-color: #0B132B; border-radius: 4px; padding: 2px 8px; font-weight: 600;")
+        self.btn_api_dashboard.setToolTip("Open Google AI Studio dashboard in browser")
+        self.btn_api_dashboard.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://aistudio.google.com/")))
+
+        self._update_template_status_badge()
+
         tpl_layout.addWidget(tpl_header)
         tpl_layout.addWidget(self.combo_template)
+        tpl_layout.addWidget(self.lbl_gemini_status)
+        tpl_layout.addWidget(self.btn_api_dashboard)
         tpl_layout.addWidget(tpl_desc)
         content_layout.addWidget(card_template)
 
@@ -1469,8 +1485,56 @@ class BulkView(QWidget):
         self.btn_pause.setText("Pause Queue")
         self._is_paused = False
         self.lbl_batch_status.setText(f"Batch Complete • {success} succeeded, {fail} failed.")
+        self._update_template_status_badge()
         QMessageBox.information(
             self,
             "Batch Generation Finished",
             f"<b>Batch Processing Complete!</b><br><br>• Successful: {success}<br>• Failed: {fail}<br><br>Videos saved to destination folder."
         )
+
+    def _update_template_status_badge(self) -> None:
+        """Update subtle badge displaying Gemini AI vs Offline Heuristic matcher mode & lifetime tokens."""
+        from database.db import get_lifetime_token_stats
+        from utils.config import reload_config
+        cfg = reload_config()
+        is_t2 = (self.combo_template.currentIndex() == 1)
+        api_key = os.getenv("GEMINI_API_KEY") or cfg.gemini_api_key or ""
+        from services.gemini_matcher import SmartSceneMatcher
+        has_valid_key = SmartSceneMatcher.is_api_key_valid(api_key)
+
+        if hasattr(self, "btn_api_dashboard"):
+            self.btn_api_dashboard.setVisible(is_t2)
+
+        if is_t2:
+            stats = get_lifetime_token_stats()
+            total_toks = stats.get("total_tokens", 0)
+            cost_usd = stats.get("total_cost_usd", 0.0)
+            if has_valid_key:
+                tok_str = f"{total_toks:,}" if total_toks > 0 else "0"
+                self.lbl_gemini_status.setText(
+                    f"🤖 Gemini AI Matcher Active | Lifetime: {tok_str} tokens (~${cost_usd:.4f})"
+                )
+                self.lbl_gemini_status.setStyleSheet(
+                    "background-color: #064E3B; color: #34D399; border: 1px solid #059669; "
+                    "border-radius: 5px; font-size: 11px; font-weight: 700; padding: 5px 8px;"
+                )
+            else:
+                self.lbl_gemini_status.setText("⚡ Offline Smart Scene Matcher Active (Heuristic)")
+                self.lbl_gemini_status.setStyleSheet(
+                    "background-color: #1E293B; color: #38BDF8; border: 1px solid #0284C7; "
+                    "border-radius: 5px; font-size: 11px; font-weight: 700; padding: 5px 8px;"
+                )
+        else:
+            if has_valid_key:
+                self.lbl_gemini_status.setText("🤖 Hybrid Media Engine + Gemini Vision Scene Matching")
+                self.lbl_gemini_status.setStyleSheet(
+                    "background-color: #064E3B; color: #34D399; border: 1px solid #059669; "
+                    "border-radius: 5px; font-size: 11px; font-weight: 700; padding: 5px 8px;"
+                )
+            else:
+                self.lbl_gemini_status.setText("⚡ Hybrid Media Engine (Smart Keyword Matching)")
+                self.lbl_gemini_status.setStyleSheet(
+                    "background-color: #1E293B; color: #38BDF8; border: 1px solid #0284C7; "
+                    "border-radius: 5px; font-size: 11px; font-weight: 600; padding: 4px 8px;"
+                )
+

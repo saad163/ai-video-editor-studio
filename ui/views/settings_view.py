@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
-from utils.config import get_config, PROJECT_ROOT
+from utils.config import get_config, reload_config, PROJECT_ROOT
 from core.ffmpeg_wrapper import _nvenc_available
 
 
@@ -273,6 +273,7 @@ class SettingsView(QWidget):
         ]
         try:
             env_path.write_text("\n".join(lines), encoding="utf-8")
+            reload_config()
             QMessageBox.information(self, "Settings Saved", "Configuration saved to .env successfully.")
         except Exception as e:
             QMessageBox.critical(self, "Error Saving Settings", f"Could not write to .env: {e}")

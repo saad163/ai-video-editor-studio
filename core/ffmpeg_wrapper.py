@@ -141,6 +141,23 @@ def resolve_ffmpeg() -> tuple[str, Optional[str]]:
         import imageio_ffmpeg  # type: ignore[import-untyped]
         ff = imageio_ffmpeg.get_ffmpeg_exe()
         if _check_bin(ff):
+            # If the binary is named with version/architecture (e.g. ffmpeg-win-x86_64-v9.0.2.exe),
+            # guarantee standard 'ffmpeg.exe' alias exists alongside it for tools like yt-dlp
+            ff_path = Path(ff)
+            if ff_path.name.lower() != "ffmpeg.exe":
+                alias = ff_path.parent / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+                if not alias.exists():
+                    try:
+                        shutil.copyfile(ff, alias)
+                    except Exception as copy_err:
+                        logger.debug("Could not copy ffmpeg alias: %s", copy_err)
+
+            # Prepend binary directory to PATH so subprocesses (yt-dlp, whisper) discover ffmpeg natively
+            bin_dir = str(ff_path.parent)
+            current_path = os.environ.get("PATH", "")
+            if bin_dir not in current_path.split(os.pathsep):
+                os.environ["PATH"] = bin_dir + os.pathsep + current_path
+
             ffprobe_candidate = shutil.which("ffprobe")
             logger.info("Using imageio-ffmpeg bundled binary: %s", ff)
             return ff, (ffprobe_candidate if (ffprobe_candidate and _check_bin(ffprobe_candidate)) else None)
@@ -567,6 +584,87 @@ def _build_portrait_blurred_filter(
     return vf
 
 
+def build_crop_filter(
+    source_width: int,
+    source_height: int,
+    crop_top: int = 0,
+    crop_bottom: int = 0,
+    crop_left: int = 0,
+    crop_right: int = 0,
+) -> str:
+    """
+    Build an FFmpeg crop filter 'crop=w:h:x:y' respecting:
+      - out_w = source_w - crop_left - crop_right
+      - out_h = source_h - crop_top - crop_bottom
+      - Critical safety: clamped so out_w >= 64 and out_h >= 64
+      - Even dimensions for libx264 / yuv420p encoding safety (rounded down to nearest even integer)
+    Returns empty string if all 4 crop margins are 0 (bypassing crop filter).
+    """
+    sw = max(64, int(source_width))
+    sh = max(64, int(source_height))
+    ct = max(0, int(crop_top))
+    cb = max(0, int(crop_bottom))
+    cl = max(0, int(crop_left))
+    cr = max(0, int(crop_right))
+
+    if ct == 0 and cb == 0 and cl == 0 and cr == 0:
+        return ""
+
+    # Over-crop safety guard: prevent left + right >= width or top + bottom >= height
+    max_crop_x = max(0, sw - 64)
+    if cl + cr > max_crop_x:
+        scale_x = max_crop_x / max(1, cl + cr)
+        cl = int(cl * scale_x)
+        cr = int(cr * scale_x)
+
+    max_crop_y = max(0, sh - 64)
+    if ct + cb > max_crop_y:
+        scale_y = max_crop_y / max(1, ct + cb)
+        ct = int(ct * scale_y)
+        cb = int(cb * scale_y)
+
+    out_w = max(64, sw - cl - cr)
+    out_h = max(64, sh - ct - cb)
+
+    # Ensure even dimensions for libx264
+    out_w = out_w - (out_w % 2)
+    out_h = out_h - (out_h % 2)
+    out_w = max(64, out_w)
+    out_h = max(64, out_h)
+
+    # Re-clamp origin offsets inside boundaries
+    cl = max(0, min(cl, sw - out_w))
+    ct = max(0, min(ct, sh - out_h))
+
+    return f"crop={out_w}:{out_h}:{cl}:{ct}"
+
+
+def build_background_filter(
+    input_label: str,
+    width: int,
+    height: int,
+    blur_amount: int | float = 0,
+    output_label: str = "bg",
+) -> str:
+    """
+    Build an FFmpeg filtergraph snippet that scales and center-crops an input layer to
+    target width x height (with even dimensions), optionally applying boxblur.
+    If blur_amount is 0, the output is sharp without applying any blur filter.
+    """
+    w = int(width) if int(width) % 2 == 0 else int(width) - 1
+    h = int(height) if int(height) % 2 == 0 else int(height) - 1
+    scale_crop = f"[{input_label}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+    try:
+        b_val = float(blur_amount)
+    except (ValueError, TypeError):
+        b_val = 0.0
+
+    if b_val > 0:
+        radius = max(1, min(50, int(round(b_val if b_val > 1.0 else b_val * 40))))
+        return f"{scale_crop},boxblur={radius}[{output_label}]"
+    return f"{scale_crop}[{output_label}]"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Hardware encoder detection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -605,22 +703,23 @@ def _nvenc_available() -> bool:
     return _NVENC_AVAILABLE
 
 
-def _get_encoder_args(use_gpu: Optional[bool] = None) -> list[str]:
+def _get_encoder_args(use_gpu: Optional[bool] = None, preset_speed: str = "fast") -> list[str]:
     """
-    Return FFmpeg video encoder arguments calibrated for crisp 2K video fidelity.
+    Return FFmpeg video encoder arguments calibrated for fast performance and crisp 2K video fidelity.
 
-    CPU Fallback: -c:v libx264 -crf 19 -preset medium -pix_fmt yuv420p
-    NVENC (Production): -c:v h264_nvenc -preset p5 -cq 19 -b:v 16M -maxrate 22M
+    CPU Fallback: -c:v libx264 -crf 19 -preset veryfast/medium -pix_fmt yuv420p
+    NVENC (Production): -c:v h264_nvenc -preset p4/p5 -cq 19 -b:v 16M -maxrate 22M
     """
     cfg = get_config()
     force_cuda = cfg.compute_device == "cuda"
     force_cpu = cfg.compute_device == "cpu"
 
     if use_gpu is True or (use_gpu is None and not force_cpu and _nvenc_available()):
-        logger.debug("Encoder: h264_nvenc (2K High Quality NVENC)")
+        logger.debug("Encoder: h264_nvenc (Hardware Accelerated NVENC)")
+        nvenc_preset = "p4" if preset_speed == "fast" else "p5"
         return [
             "-c:v", "h264_nvenc",
-            "-preset", "p5",            # High-quality preset
+            "-preset", nvenc_preset,    # p4: fast hardware performance; p5: high quality
             "-rc", "vbr",
             "-cq", "19",
             "-b:v", "16M",
@@ -629,10 +728,11 @@ def _get_encoder_args(use_gpu: Optional[bool] = None) -> list[str]:
             "-pix_fmt", "yuv420p",
         ]
 
-    logger.debug("Encoder: libx264 (2K High Quality CPU)")
+    logger.debug("Encoder: libx264 (High Quality CPU)")
+    cpu_preset = "veryfast" if preset_speed == "fast" else "medium"
     return [
         "-c:v", "libx264",
-        "-preset", "medium",        # Crisp visual encoding
+        "-preset", cpu_preset,        # veryfast for rapid subclip rendering; medium for final encode
         "-crf", "19",               # High visual fidelity (visually lossless)
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",  # Web-compatible MP4
@@ -861,6 +961,17 @@ def concatenate_clips(
     concat_list = cfg.temp_cache_dir / "concat_list.txt"
     _write_concat_list(clip_paths, concat_list)
 
+    # ── Optional SFX track mixdown ─────────────────────────────────────────────
+    sfx_path = kwargs.get("sfx_path")
+    if sfx_path and Path(sfx_path).exists():
+        try:
+            from services.sfx_manager import SFXManager
+            sfx_mgr = SFXManager()
+            mixed_tmp = cfg.temp_cache_dir / f"concat_mixed_{int(time.time() * 1000)}.wav"
+            audio_path = sfx_mgr.mix_voiceover_with_sfx(audio_path, Path(sfx_path), mixed_tmp)
+        except Exception as sfx_err:
+            logger.warning("Could not mix sfx_path in concatenate_clips: %s", sfx_err)
+
     # ── Build filter_complex / -vf chain ──────────────────────────────────────
     # Subtitle filter needs special Windows path treatment:
     # backslashes → forward slashes, colon in drive letter escaped as \\:
@@ -916,6 +1027,97 @@ def concatenate_clips(
     return output_path
 
 
+def lossless_concat_videos(
+    video_paths: list[Path],
+    output_path: Path,
+    progress_cb: Optional[Callable[[float], None]] = None,
+) -> Path:
+    """
+    Losslessly concatenate pre-rendered video parts into a single video file
+    using the FFmpeg concat demuxer (-c copy) without re-encoding.
+
+    Parameters
+    ----------
+    video_paths : List of pre-rendered MP4 video part paths with identical codec/parameters.
+    output_path : Target destination path for unified MP4.
+    progress_cb : Optional progress callback (0.0 to 1.0).
+
+    Returns
+    -------
+    output_path after successful merge.
+    """
+    if not video_paths:
+        raise ValueError("video_paths is empty — nothing to concatenate.")
+    if len(video_paths) == 1:
+        out = Path(output_path).resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if Path(video_paths[0]).resolve() != out:
+            shutil.copy2(video_paths[0], out)
+        if progress_cb:
+            progress_cb(1.0)
+        return out
+
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = get_config()
+
+    concat_list = cfg.temp_cache_dir / f"concat_parts_{int(time.time() * 1000)}.txt"
+    _write_concat_list(video_paths, concat_list)
+
+    cmd = [
+        _ff(),
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_list),
+        "-c", "copy",
+        str(output_path),
+    ]
+
+    total_duration = sum(probe_media(p).duration for p in video_paths if p.exists())
+    logger.info("Losslessly concatenating %d video parts → %s", len(video_paths), output_path.name)
+    try:
+        _run_with_progress(cmd, total_duration, label="Lossless part merge", progress_cb=progress_cb)
+    finally:
+        try:
+            concat_list.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return output_path
+
+
+def extract_audio(
+    video_path: Path,
+    output_audio_path: Path,
+    sample_rate: int = 16000,
+    channels: int = 1,
+) -> Path:
+    """
+    Extract audio track from video file as lightweight mono 16kHz WAV or MP3
+    optimized for Whisper speech recognition.
+    """
+    video_path = Path(video_path).resolve()
+    output_audio_path = Path(output_audio_path).resolve()
+    output_audio_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    cmd = [
+        _ff(),
+        "-y",
+        "-i", str(video_path),
+        "-vn",
+        "-ar", str(sample_rate),
+        "-ac", str(channels),
+        str(output_audio_path),
+    ]
+    logger.info("Extracting lightweight audio (16kHz mono) from %s → %s", video_path.name, output_audio_path.name)
+    _run_with_progress(cmd, total_duration=0.0, label="Extract audio")
+    return output_audio_path
+
+
 def extract_subclip(
     video_path: Path,
     start_sec: float,
@@ -924,22 +1126,28 @@ def extract_subclip(
     resolution: str = DEFAULT_RESOLUTION,
     target_duration: Optional[float] = None,
     keep_audio: bool = False,
+    strip_source_audio: bool = True,
+    allow_stream_copy: bool = False,
     progress_cb: Optional[Callable[[float], None]] = None,
 ) -> Path:
     """
     Extract a normalized scene slice from a source video file (e.g., episode footage).
     Ensures uniform resolution (Lanczos scale + letterbox/pillarbox pad) and framerate (30 fps).
+    Automatically strips raw source audio (-an) by default so episode audio does not bleed into voiceovers.
+    Uses fast hardware-accelerated / veryfast encoding presets for rapid batch extraction.
 
     Parameters
     ----------
-    video_path      : Path to source video file
-    start_sec       : Start timestamp in seconds
-    end_sec         : End timestamp in seconds
-    output_path     : Destination MP4 path
-    resolution      : '1080p' (1920x1080) or '2k' (2560x1440)
-    target_duration : Optional target duration in seconds to trim or pad
-    keep_audio      : Whether to preserve original audio track (False = mute for voiceover overlay)
-    progress_cb     : Callback receiving progress float (0.0 to 1.0)
+    video_path         : Path to source video file
+    start_sec          : Start timestamp in seconds
+    end_sec            : End timestamp in seconds
+    output_path        : Destination MP4 path
+    resolution         : '1080p' (1920x1080) or '2k' (2560x1440)
+    target_duration    : Optional target duration in seconds to trim or pad
+    keep_audio         : Whether to preserve original audio track (False = mute for voiceover overlay)
+    strip_source_audio : Explicit flag to force-strip source audio with -an (default: True)
+    allow_stream_copy  : Use FFmpeg stream-copy (-c:v copy) when dimensions already match and no padding is needed.
+    progress_cb        : Callback receiving progress float (0.0 to 1.0)
     """
     video_path = Path(video_path).resolve()
     output_path = Path(output_path).resolve()
@@ -948,38 +1156,76 @@ def extract_subclip(
     if not video_path.exists():
         raise FileNotFoundError(f"Source video not found: {video_path}")
 
+    # Determine whether source audio must be stripped (default: True)
+    should_strip_audio = strip_source_audio or (not keep_audio)
+    info = None
+    try:
+        info = probe_media(video_path)
+        if info.has_audio and should_strip_audio:
+            logger.debug("Source video '%s' contains audio stream; stripping audio track (-an).", video_path.name)
+    except Exception:
+        pass
+
     raw_dur = max(end_sec - start_sec, 0.1)
     effective_dur = target_duration if target_duration is not None and target_duration > 0 else raw_dur
 
     w, h = RESOLUTIONS.get(resolution, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
-    # Scale with aspect ratio maintained + pad to exact canvas dimensions
-    vf = (
-        f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,"
-        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"setsar=1,fps={OUTPUT_FPS}"
+    # Fast stream-copy path when allowed and video matches target dimensions exactly without padding
+    can_stream_copy = (
+        allow_stream_copy
+        and info is not None
+        and info.width == w
+        and info.height == h
+        and raw_dur >= effective_dur
     )
 
-    enc = _get_encoder_args()
+    if can_stream_copy:
+        cmd = [
+            _ff(),
+            "-y",
+            "-ss", f"{start_sec:.3f}",
+            "-i", str(video_path),
+            "-t", f"{effective_dur:.3f}",
+            "-c:v", "copy",
+            "-avoid_negative_ts", "make_zero",
+            *(["-an"] if should_strip_audio else ["-c:a", "copy"]),
+            str(output_path),
+        ]
+    else:
+        # Scale with aspect ratio maintained + pad to exact canvas dimensions
+        vf_filters = [
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos",
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
+            "setsar=1",
+            f"fps={OUTPUT_FPS}",
+        ]
+        if raw_dur < effective_dur:
+            pad_sec = effective_dur - raw_dur
+            vf_filters.append(f"tpad=stop_mode=clone:stop_duration={pad_sec:.3f}")
 
-    cmd = [
-        _ff(),
-        "-y",
-        "-ss", f"{start_sec:.3f}",
-        "-to", f"{end_sec:.3f}",
-        "-i", str(video_path),
-        "-vf", vf,
-        *enc,
-        *(["-c:a", "aac", "-b:a", "128k"] if keep_audio else ["-an"]),
-        "-t", f"{effective_dur:.3f}",
-        str(output_path),
-    ]
+        vf = ",".join(vf_filters)
+        enc = _get_encoder_args(preset_speed="fast")
+
+        cmd = [
+            _ff(),
+            "-y",
+            "-ss", f"{start_sec:.3f}",
+            "-to", f"{max(end_sec, start_sec + effective_dur):.3f}",
+            "-i", str(video_path),
+            "-vf", vf,
+            *enc,
+            *(["-an"] if should_strip_audio else ["-c:a", "aac", "-b:a", "128k"]),
+            "-t", f"{effective_dur:.3f}",
+            str(output_path),
+        ]
 
     logger.info(
-        "Extracting subclip [%.2fs - %.2fs (%.2fs)] from %s → %s",
+        "Extracting subclip [%.2fs - %.2fs (%.2fs)%s] from %s → %s",
         start_sec,
         end_sec,
         effective_dur,
+        " (stream-copy)" if can_stream_copy else "",
         video_path.name,
         output_path.name,
     )

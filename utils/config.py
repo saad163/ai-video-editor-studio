@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
 # Load .env from project root (silently does nothing if the file is absent)
-load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,6 +136,13 @@ def get_config() -> AppConfig:
         directory.mkdir(parents=True, exist_ok=True)
 
     return cfg
+
+
+def reload_config() -> AppConfig:
+    """Clear lru_cache and reload .env settings dynamically."""
+    load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=True)
+    get_config.cache_clear()
+    return get_config()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -122,6 +122,8 @@ def test_worker_signals_compatibility(qapp, tmp_path):
 
 
 def test_player_view_and_play_signal(qapp, tmp_path):
+    from unittest.mock import patch
+    from core.ffmpeg_wrapper import MediaInfo
     from ui.main_window import MainWindow
 
     win = MainWindow()
@@ -132,7 +134,9 @@ def test_player_view_and_play_signal(qapp, tmp_path):
     assert win.stack.currentIndex() == 0
 
     # Emitting request_play_video should transition to Player View (4)
-    win.studio_view.request_play_video.emit(str(fake_video))
-    assert win.stack.currentIndex() == 4
-    assert win.player_view._current_video == fake_video
+    with patch.object(win.player_view._player, "setSource"), \
+         patch("ui.views.player_view.probe_media", return_value=MediaInfo(path=fake_video, width=1920, height=1080, duration=10.0, video_codec="h264", audio_codec="aac")):
+        win.studio_view.request_play_video.emit(str(fake_video))
+        assert win.stack.currentIndex() == 4
+        assert win.player_view._current_video == fake_video
 

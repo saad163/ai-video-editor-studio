@@ -19,8 +19,8 @@ SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".ts"}
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp", ".jfif"}
 
 
-def compute_file_hash(path: Path, algorithm: str = "sha256", chunk_size: int = 65536) -> str:
-    """Return hex digest of a file using the specified algorithm."""
+def compute_file_hash(path: Path, algorithm: str = "sha256", chunk_size: int = 1048576) -> str:
+    """Return hex digest of a file using the specified algorithm (fast 1MB buffered hashing)."""
     h = hashlib.new(algorithm)
     with open(path, "rb") as f:
         while chunk := f.read(chunk_size):

@@ -10,11 +10,21 @@ Integration and unit tests for Step 3 & Step 4 Bulk Generation features:
 """
 
 from pathlib import Path
+from unittest.mock import patch
 import pytest
 from PySide6.QtCore import Qt
 
 from ui.views.bulk_view import BulkView
 from ui.workers.bulk_worker import BulkJob, BulkQueueWorker
+
+
+@pytest.fixture(autouse=True)
+def mock_qmessagebox():
+    """Prevent blocking modal dialogs during automated tests."""
+    with patch("PySide6.QtWidgets.QMessageBox.information"), \
+         patch("PySide6.QtWidgets.QMessageBox.warning"), \
+         patch("PySide6.QtWidgets.QMessageBox.critical"):
+        yield
 
 
 def test_bulk_limit_and_scan(qapp, tmp_path):

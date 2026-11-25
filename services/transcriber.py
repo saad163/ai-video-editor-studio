@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Optional, Callable, Any
 
 from utils.config import get_config
-from utils.file_helpers import compute_file_hash, is_audio_file
+from utils.file_helpers import compute_file_hash, is_audio_file, is_video_file
 from database.db import (
     init_db,
     insert_transcription,
@@ -321,6 +321,7 @@ class TranscriptionService:
         max_words_per_chunk: int = 6,
         beam_size: int = 5,
         vad_filter: bool = True,
+        cleanup_temp_audio: bool = False,
         progress_cb: Optional[Callable[[float], None]] = None,
         **kwargs: Any,
     ) -> TranscriptionResult:
@@ -329,8 +330,8 @@ class TranscriptionService:
 
         Parameters
         ----------
-        audio_path          : Path to MP3/WAV/M4A/FLAC audio file.
-        project_id          : SQLite project id; if provided, result is persisted.
+        audio_path          : Path to MP3/WAV/M4A/FLAC audio file or MP4/MKV video file.
+        project_id          : SQLite project id; if provided (or None), result is persisted.
         language            : ISO 639-1 language code (default 'en' for clean English).
         task                : 'transcribe' or 'translate' (translates foreign speech to English).
         word_timestamps     : Include word-level timing.
@@ -340,15 +341,16 @@ class TranscriptionService:
         max_words_per_chunk : Maximum words per subtitle event.
         beam_size           : Beam search width (5 = default quality).
         vad_filter          : Strip silent segments with VAD before transcribing.
+        cleanup_temp_audio  : Automatically delete audio_path if it was an ephemeral temp file.
         """
         audio_path = Path(audio_path).resolve()
 
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        if not is_audio_file(audio_path):
+        if not (is_audio_file(audio_path) or is_video_file(audio_path)):
             raise ValueError(
-                f"Unsupported audio format: {audio_path.suffix}. "
-                f"Supported: .mp3 .wav .aac .flac .ogg .m4a"
+                f"Unsupported audio or video format: {audio_path.suffix}. "
+                f"Supported: .mp3 .wav .aac .flac .ogg .m4a .mp4 .mov .avi .mkv .webm"
             )
 
         # ── Cache check ────────────────────────────────────────────────────────
@@ -364,6 +366,12 @@ class TranscriptionService:
                     progress_cb(1.0)
                 raw_segs = _segments_from_json(cached_row["segments_json"])
                 segments = chunk_segments(raw_segs, max_words=max_words_per_chunk) if chunk_subtitles else raw_segs
+                if cleanup_temp_audio and audio_path.exists():
+                    try:
+                        audio_path.unlink(missing_ok=True)
+                        logger.info("Cleaned up temporary audio file on cache hit: %s", audio_path.name)
+                    except Exception as e:
+                        logger.warning("Could not delete temp audio on cache hit: %s", e)
                 return TranscriptionResult(
                     audio_path=audio_path,
                     audio_hash=audio_hash,
@@ -375,95 +383,126 @@ class TranscriptionService:
                     from_cache=True,
                 )
 
-        # ── Load model ─────────────────────────────────────────────────────────
-        if progress_cb:
-            progress_cb(0.1)
-        self._load_model()
+        temp_extracted_wav: Optional[Path] = None
+        target_to_transcribe = audio_path
+        cfg = get_config()
 
-        # ── Run transcription ──────────────────────────────────────────────────
-        logger.info("Transcribing '%s' [lang=%s, task=%s] …", audio_path.name, language, task)
-        t0 = time.perf_counter()
+        try:
+            # If input is a video file, extract lightweight 16kHz mono WAV for fast Whisper decoding
+            if is_video_file(audio_path):
+                from core.ffmpeg_wrapper import extract_audio
+                temp_extracted_wav = cfg.temp_cache_dir / f"extracted_{audio_hash[:16]}.wav"
+                try:
+                    if not temp_extracted_wav.exists():
+                        extract_audio(audio_path, temp_extracted_wav)
+                    if temp_extracted_wav.exists() and temp_extracted_wav.stat().st_size > 0:
+                        target_to_transcribe = temp_extracted_wav
+                except Exception as extract_err:
+                    logger.debug("Fast audio extraction skipped or failed (%s); decoding directly.", extract_err)
+                    target_to_transcribe = audio_path
 
-        raw_segments, info = self._model.transcribe(
-            str(audio_path),
-            language=language,
-            task=task,
-            beam_size=beam_size,
-            word_timestamps=word_timestamps,
-            vad_filter=vad_filter,
-            vad_parameters={
-                "min_silence_duration_ms": 500,
-                "speech_pad_ms": 400,
-            },
-        )
+            # ── Load model ─────────────────────────────────────────────────────────
+            if progress_cb:
+                progress_cb(0.1)
+            self._load_model()
 
-        total_dur = getattr(info, "duration", 0.0) or 1.0
+            # ── Run transcription ──────────────────────────────────────────────────
+            logger.info("Transcribing '%s' [lang=%s, task=%s] …", target_to_transcribe.name, language, task)
+            t0 = time.perf_counter()
 
-        # Materialise generator into list
-        segments: list[TranscriptionSegment] = []
-        for raw_seg in raw_segments:
-            if progress_cb and total_dur > 0:
-                pct = min(0.1 + 0.85 * (raw_seg.end / total_dur), 0.95)
-                progress_cb(pct)
-            words = []
-            if word_timestamps and raw_seg.words:
-                words = [
-                    WordTimestamp(
-                        word=w.word,
-                        start=w.start,
-                        end=w.end,
-                        probability=w.probability,
-                    )
-                    for w in raw_seg.words
-                ]
-            segments.append(
-                TranscriptionSegment(
-                    start=raw_seg.start,
-                    end=raw_seg.end,
-                    text=raw_seg.text,
-                    words=words,
-                    avg_logprob=raw_seg.avg_logprob,
-                    no_speech_prob=raw_seg.no_speech_prob,
-                )
+            raw_segments, info = self._model.transcribe(
+                str(target_to_transcribe),
+                language=language,
+                task=task,
+                beam_size=beam_size,
+                word_timestamps=word_timestamps,
+                vad_filter=vad_filter,
+                vad_parameters={
+                    "min_silence_duration_ms": 500,
+                    "speech_pad_ms": 400,
+                },
             )
 
-        elapsed = time.perf_counter() - t0
-        detected_language = info.language or (language or "en")
-        full_text = " ".join(seg.text.strip() for seg in segments)
+            total_dur = getattr(info, "duration", 0.0) or 1.0
 
-        # Apply bite-sized chunking
-        if chunk_subtitles:
-            segments = chunk_segments(segments, max_words=max_words_per_chunk)
+            # Materialise generator into list
+            segments: list[TranscriptionSegment] = []
+            for raw_seg in raw_segments:
+                if progress_cb and total_dur > 0:
+                    pct = min(0.1 + 0.85 * (raw_seg.end / total_dur), 0.95)
+                    progress_cb(pct)
+                words = []
+                if word_timestamps and raw_seg.words:
+                    words = [
+                        WordTimestamp(
+                            word=w.word,
+                            start=w.start,
+                            end=w.end,
+                            probability=w.probability,
+                        )
+                        for w in raw_seg.words
+                    ]
+                segments.append(
+                    TranscriptionSegment(
+                        start=raw_seg.start,
+                        end=raw_seg.end,
+                        text=raw_seg.text,
+                        words=words,
+                        avg_logprob=raw_seg.avg_logprob,
+                        no_speech_prob=raw_seg.no_speech_prob,
+                    )
+                )
 
-        logger.info(
-            "Transcription complete: %d chunked segments | language=%s | %.1f s",
-            len(segments), detected_language, elapsed,
-        )
+            elapsed = time.perf_counter() - t0
+            detected_language = info.language or (language or "en")
+            full_text = " ".join(seg.text.strip() for seg in segments)
 
-        result = TranscriptionResult(
-            audio_path=audio_path,
-            audio_hash=audio_hash,
-            language=detected_language,
-            full_text=full_text,
-            segments=segments,
-            model_used=self._model_size,
-            elapsed_seconds=elapsed,
-            from_cache=False,
-        )
+            # Apply bite-sized chunking
+            if chunk_subtitles:
+                segments = chunk_segments(segments, max_words=max_words_per_chunk)
 
-        # ── Persist to DB ──────────────────────────────────────────────────────
-        if project_id is not None:
+            logger.info(
+                "Transcription complete: %d chunked segments | language=%s | %.1f s",
+                len(segments), detected_language, elapsed,
+            )
+
+            result = TranscriptionResult(
+                audio_path=audio_path,
+                audio_hash=audio_hash,
+                language=detected_language,
+                full_text=full_text,
+                segments=segments,
+                model_used=self._model_size,
+                elapsed_seconds=elapsed,
+                from_cache=False,
+            )
+
+            # ── Persist to DB ──────────────────────────────────────────────────────
             self._persist(result, project_id, audio_path)
 
-        if progress_cb:
-            progress_cb(1.0)
+            if progress_cb:
+                progress_cb(1.0)
 
-        return result
+            return result
+
+        finally:
+            if temp_extracted_wav and temp_extracted_wav.exists():
+                try:
+                    temp_extracted_wav.unlink(missing_ok=True)
+                    logger.info("Cleaned up temporary extracted audio file: %s", temp_extracted_wav.name)
+                except Exception as e:
+                    logger.warning("Could not delete temp extracted audio %s: %s", temp_extracted_wav, e)
+            if cleanup_temp_audio and audio_path.exists():
+                try:
+                    audio_path.unlink(missing_ok=True)
+                    logger.info("Cleaned up temporary audio file: %s", audio_path.name)
+                except Exception as e:
+                    logger.warning("Could not delete temp audio %s: %s", audio_path, e)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
     def _persist(
-        self, result: TranscriptionResult, project_id: int, audio_path: Path
+        self, result: TranscriptionResult, project_id: Optional[int], audio_path: Path
     ) -> None:
         """Save audio asset and transcription to SQLite."""
         try:
@@ -472,7 +511,7 @@ class TranscriptionService:
                     project_id=project_id,
                     file_path=str(audio_path),
                     file_hash=result.audio_hash,
-                    media_type="audio",
+                    media_type="audio" if is_audio_file(audio_path) else "video",
                 )
             insert_transcription(
                 project_id=project_id,

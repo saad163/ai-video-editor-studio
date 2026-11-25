@@ -17,10 +17,13 @@ Features:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Any
 
 from services.transcriber import TranscriptionResult, TranscriptionSegment
 from utils.logger import get_logger
@@ -175,6 +178,232 @@ class SubtitleStyle:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Subtitle Translation & Sanitization Helpers (Always-English Subtitles)
+# ─────────────────────────────────────────────────────────────────────────────
+
+URDU_TO_ENGLISH_FALLBACK: dict[str, str] = {
+    "بادشاہ": "The King",
+    "ملکہ": "The Queen",
+    "شہزادہ": "The Prince",
+    "شہزادی": "The Princess",
+    "شاہی": "Royal",
+    "محل": "palace",
+    "سلامت": "Majesty",
+    "تشریف": "arrived",
+    "لائے": "came",
+    "وزیر": "The Minister",
+    "اعلان": "announcement",
+    "کہانی": "story",
+    "ایک": "a",
+    "اور": "and",
+    "تھا": "was",
+    "تھی": "was",
+    "تھے": "were",
+    "ہے": "is",
+    "ہیں": "are",
+    "میں": "in",
+    "پر": "on",
+    "سے": "from",
+    "کو": "to",
+    "کا": "of",
+    "کی": "of",
+    "کے": "of",
+    "نے": "has",
+    "کیا": "made",
+    "یہ": "This",
+    "وہ": "That",
+    "سب": "all",
+    "جھک": "bowed",
+    "کر": "and",
+    "جنگ": "war",
+    "خبر": "news",
+    "سنائی": "shared",
+    "لوگ": "people",
+    "وقت": "time",
+    "دن": "day",
+    "رات": "night",
+    "شہر": "city",
+    "زندگی": "life",
+}
+
+
+def has_non_latin_script(text: str) -> bool:
+    """Detect if string contains Arabic/Urdu, Devanagari, Cyrillic, CJK, etc."""
+    return bool(re.search(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF\u0900-\u097F\u4E00-\u9FFF\u0400-\u04FF]", text))
+
+
+def has_non_latin_script_in_segments(segments: Sequence[TranscriptionSegment]) -> bool:
+    """Check if any segment in the collection contains non-Latin or Arabic/Urdu script."""
+    return any(has_non_latin_script(s.text) for s in segments)
+
+
+def sanitize_english_text(text: str) -> str:
+    """Strictly strip any non-Latin or Arabic/Urdu characters and normalize whitespace."""
+    # Strip any Urdu/Arabic/non-Latin scripts
+    cleaned = re.sub(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF\u0900-\u097F\u4E00-\u9FFF\u0400-\u04FF]", "", text)
+    # Collapse duplicate whitespace
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _sanitize_segment_list(segments: list[TranscriptionSegment]) -> list[TranscriptionSegment]:
+    """Sanitize segment text, clamp timestamps, and deduplicate consecutive identical lines."""
+    sanitized: list[TranscriptionSegment] = []
+    prev_text = ""
+    for s in segments:
+        clean_text = sanitize_english_text(s.text)
+        if not clean_text:
+            continue
+        # Avoid exact duplicate back-to-back lines
+        if clean_text.lower() == prev_text.lower():
+            continue
+        start_t = max(0.0, s.start)
+        end_t = max(start_t + 0.3, s.end)
+        sanitized.append(
+            TranscriptionSegment(
+                start=start_t,
+                end=end_t,
+                text=clean_text,
+                words=s.words,
+                avg_logprob=s.avg_logprob,
+                no_speech_prob=s.no_speech_prob,
+            )
+        )
+        prev_text = clean_text
+    return sanitized
+
+
+def _translate_segments_with_gemini(
+    segments: list[TranscriptionSegment],
+    api_key: str,
+    source_language: str,
+) -> list[TranscriptionSegment]:
+    from services.gemini_resolver import generate_content_with_fallback
+
+    batch_payload = [
+        {"i": idx, "start": round(s.start, 2), "end": round(s.end, 2), "text": s.text}
+        for idx, s in enumerate(segments)
+    ]
+    prompt = (
+        f"You are an expert film translator and subtitle editor. "
+        f"Translate the following timestamped subtitle segments from {source_language} into concise, "
+        "accurate, natural English subtitles for video overlay.\n\n"
+        "Rules:\n"
+        "1. Output strictly valid JSON format: a list of objects with keys 'i', 'start', 'end', and 'text'.\n"
+        "2. The 'text' MUST be strictly in English only. NEVER include any Urdu or foreign non-Latin characters.\n"
+        "3. Preserve the exact 'start' and 'end' timestamps for each segment 'i'.\n"
+        "4. Keep each subtitle line concise (5 to 7 words where possible).\n\n"
+        f"Input Segments ({source_language}):\n{json.dumps(batch_payload, separators=(',', ':'), ensure_ascii=False)}"
+    )
+
+    resp, _ = generate_content_with_fallback(
+        api_key=api_key,
+        contents=prompt,
+        generation_config={"response_mime_type": "application/json", "temperature": 0.2},
+        timeout=45.0,
+    )
+
+    data = json.loads(resp.text)
+    mapping = {item["i"]: item["text"] for item in data if "i" in item and "text" in item}
+
+    translated = []
+    for idx, s in enumerate(segments):
+        t_text = mapping.get(idx, "")
+        if not t_text:
+            t_text = sanitize_english_text(s.text)
+        translated.append(
+            TranscriptionSegment(
+                start=s.start,
+                end=s.end,
+                text=t_text,
+                words=[],
+                avg_logprob=s.avg_logprob,
+                no_speech_prob=s.no_speech_prob,
+            )
+        )
+    return translated
+
+
+def translate_and_sanitize_to_english(
+    segments: list[TranscriptionSegment],
+    gemini_api_key: Optional[str] = None,
+    source_language: str = "ur",
+    audio_path: Optional[Path] = None,
+) -> list[TranscriptionSegment]:
+    """
+    Translates non-English subtitle segments to English and sanitizes the output.
+    Ensures timestamps stay strictly aligned and zero non-English characters leak.
+    """
+    if not segments:
+        return []
+
+    # If all segments are already English, sanitize and return
+    if not has_non_latin_script_in_segments(segments) and source_language.lower() in ("en", "english"):
+        return _sanitize_segment_list(segments)
+
+    # 1. Try Google Gemini batch translation if key is available
+    api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
+    if api_key:
+        from services.gemini_matcher import SmartSceneMatcher
+        if SmartSceneMatcher.is_api_key_valid(api_key):
+            try:
+                translated = _translate_segments_with_gemini(segments, api_key, source_language)
+                if translated and len(translated) == len(segments):
+                    return _sanitize_segment_list(translated)
+            except Exception as e:
+                logger.warning("Gemini subtitle translation failed (%s), falling back to offline translator", e)
+
+    # 2. Try Whisper translation if audio exists
+    if audio_path and Path(audio_path).exists():
+        try:
+            from services.transcriber import TranscriptionService
+            ts = TranscriptionService()
+            whisper_res = ts.transcribe(
+                Path(audio_path),
+                language=source_language,
+                task="translate",
+                chunk_subtitles=True,
+                max_words_per_chunk=6,
+                use_cache=True,
+            )
+            if whisper_res and whisper_res.segments:
+                return _sanitize_segment_list(whisper_res.segments)
+        except Exception as we:
+            logger.debug("Whisper translation fallback skipped or failed: %s", we)
+
+    # 3. Deterministic offline translation dictionary & sanitization fallback
+    fallback_segments = []
+    for s in segments:
+        eng_words = []
+        for word in s.text.split():
+            clean_w = word.strip("،؛؟۔.,!?:;")
+            punct = word[len(clean_w):] if len(word) > len(clean_w) else ""
+            if clean_w in URDU_TO_ENGLISH_FALLBACK:
+                eng_words.append(URDU_TO_ENGLISH_FALLBACK[clean_w] + punct)
+            else:
+                latin = sanitize_english_text(clean_w)
+                if latin:
+                    eng_words.append(latin + punct)
+
+        translated_text = " ".join(eng_words).strip()
+        if not translated_text:
+            translated_text = f"Scene event at {s.start:.1f}s"
+
+        fallback_segments.append(
+            TranscriptionSegment(
+                start=s.start,
+                end=s.end,
+                text=translated_text,
+                words=[],
+                avg_logprob=s.avg_logprob,
+                no_speech_prob=s.no_speech_prob,
+            )
+        )
+
+    return _sanitize_segment_list(fallback_segments)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Subtitle Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -182,6 +411,7 @@ class SubtitleEngine:
     """
     Converts TranscriptionResult → clean, high-impact 2K ASS or SRT subtitle file.
     Supports dynamic colors, outline mode, and solid/semi-transparent background box.
+    Enforces strictly English-only subtitles regardless of narration language.
     """
 
     def __init__(
@@ -205,10 +435,15 @@ class SubtitleEngine:
         vertical_margin: int = 90,
         max_chars_per_line: int = 38,
         resolution: str = "2k",
+        gemini_api_key: Optional[str] = None,
+        ensure_english: bool = True,
+        **kwargs: Any,
     ) -> None:
         self.resolution = resolution.lower()
         res_pair = SUBTITLE_RESOLUTIONS.get(self.resolution, (_PLAY_RES_X, _PLAY_RES_Y))
         self.play_res_x, self.play_res_y = res_pair
+        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
+        self.ensure_english = ensure_english
 
         effective_text_color = text_color if text_color is not None else color
         primary_ass = to_ass_color(effective_text_color, alpha=0)
@@ -263,19 +498,32 @@ class SubtitleEngine:
         self,
         transcription: TranscriptionResult,
         output_path: Path,
+        ensure_english: Optional[bool] = None,
     ) -> Path:
         """
         Write an ASS subtitle file from *transcription* to *output_path*.
+        If ensure_english is True (default), automatically translates any Urdu or
+        non-English script to clean, aligned English subtitles before writing.
         """
         output_path = Path(output_path).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        content = self._build_ass(transcription.segments)
+        do_english = self.ensure_english if ensure_english is None else ensure_english
+        segments = transcription.segments
+        if do_english and (has_non_latin_script_in_segments(segments) or (transcription.language and transcription.language.lower() not in ("en", "english"))):
+            segments = translate_and_sanitize_to_english(
+                segments,
+                gemini_api_key=self.gemini_api_key,
+                source_language=transcription.language or "ur",
+                audio_path=getattr(transcription, "audio_path", None),
+            )
+
+        content = self._build_ass(segments)
         output_path.write_text(content, encoding="utf-8-sig")
 
         logger.info(
-            "ASS subtitles written: %d events → %s",
-            len(transcription.segments), output_path.name,
+            "ASS subtitles written: %d events → %s (English guaranteed)",
+            len(segments), output_path.name,
         )
         return output_path
 
@@ -283,13 +531,24 @@ class SubtitleEngine:
         self,
         transcription: TranscriptionResult,
         output_path: Path,
+        ensure_english: Optional[bool] = None,
     ) -> Path:
-        """Write a plain SRT subtitle file (no styling). Returns *output_path*."""
+        """Write a plain SRT subtitle file (strictly English). Returns *output_path*."""
         output_path = Path(output_path).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        do_english = self.ensure_english if ensure_english is None else ensure_english
+        segments = transcription.segments
+        if do_english and (has_non_latin_script_in_segments(segments) or (transcription.language and transcription.language.lower() not in ("en", "english"))):
+            segments = translate_and_sanitize_to_english(
+                segments,
+                gemini_api_key=self.gemini_api_key,
+                source_language=transcription.language or "ur",
+                audio_path=getattr(transcription, "audio_path", None),
+            )
+
         lines: list[str] = []
-        for idx, seg in enumerate(transcription.segments, start=1):
+        for idx, seg in enumerate(segments, start=1):
             text = self._wrap_text(seg.text.strip())
             lines.append(str(idx))
             lines.append(f"{_to_srt_time(seg.start)} --> {_to_srt_time(seg.end)}")
@@ -297,7 +556,7 @@ class SubtitleEngine:
             lines.append("")
 
         output_path.write_text("\n".join(lines), encoding="utf-8")
-        logger.info("SRT subtitles written: %d events → %s", len(transcription.segments), output_path.name)
+        logger.info("SRT subtitles written: %d events → %s (English guaranteed)", len(segments), output_path.name)
         return output_path
 
     # ── ASS Document Builder ───────────────────────────────────────────────────

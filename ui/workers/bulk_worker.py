@@ -132,6 +132,60 @@ class BulkQueueWorker(QThread):
             t_start = time.perf_counter()
 
             try:
+                # ── Step 0: Route Template 2 (Episode Scene Matching) ─────────
+                if job.template_type == "template_2":
+                    from services.episode_compiler import EpisodeCompiler, EpisodeCompileConfig
+                    compile_cfg = EpisodeCompileConfig(
+                        audio_path=job.audio_path,
+                        footage_path=job.videos_path or job.images_dir,
+                        output_path=job.output_path,
+                        title=job.title,
+                        resolution=job.resolution,
+                        clip_duration=job.clip_duration,
+                        text_color=job.text_color,
+                        highlight_color=job.highlight_color,
+                        has_bg_box=job.has_bg_box,
+                        bg_style=job.bg_style,
+                        bg_color=job.bg_color,
+                        bg_opacity=job.bg_opacity,
+                        stroke_color=job.stroke_color,
+                        stroke_thickness=job.stroke_thickness,
+                        font_size=job.font_size,
+                        font_family=job.font_family,
+                        bold=job.bold,
+                        italic=job.italic,
+                        box_padding=job.box_padding,
+                        generate_chapters=job.generate_chapters,
+                        gemini_api_key=cfg.gemini_api_key,
+                    )
+
+                    def _ep_audio_cb(pct: int) -> None:
+                        self.job_progress.emit(row_idx, int(pct * 0.3), "Transcribing voiceover...")
+
+                    def _ep_render_cb(pct: int) -> None:
+                        self.job_progress.emit(row_idx, pct, "Matching scenes & compiling episode...")
+
+                    def _ep_status_cb(msg: str) -> None:
+                        self.status_message.emit(f"({row_idx + 1}/{total_jobs}) {msg}")
+
+                    compiler = EpisodeCompiler(
+                        config=compile_cfg,
+                        audio_progress_cb=_ep_audio_cb,
+                        render_progress_cb=_ep_render_cb,
+                        status_cb=_ep_status_cb,
+                        is_cancelled_cb=lambda: self._is_cancelled,
+                    )
+                    res = compiler.compile()
+                    if self._is_cancelled or res is None:
+                        break
+
+                    self.job_progress.emit(row_idx, 100, "Done")
+                    self.job_completed.emit(row_idx, str(job.output_path))
+                    success_count += 1
+                    self.batch_progress.emit(row_idx + 1, total_jobs)
+                    continue
+
+                # ── Template 1 Pipeline ────────────────────────────────────────
                 # ── Step 0: DB Project ─────────────────────────────────────────
                 project_id = create_project(job.title, template_type="template_1_bulk")
                 update_project_status(project_id, "processing")
@@ -217,94 +271,61 @@ class BulkQueueWorker(QThread):
                 clips_dir.mkdir(parents=True, exist_ok=True)
                 clip_paths: list[Path] = []
 
-                if job.template_type == "template_2":
-                    # Template 2: Episode Scene Matching Pipeline
-                    from utils.file_helpers import is_video_file
-                    from services.scene_detector import SceneDetectorService, Scene
-                    from services.gemini_matcher import NarrativeChunker, SmartSceneMatcher
+                # Template 1 (Hybrid Images & Video Mix)
+                image_semantics = {}
+                if job.images_dir and job.images_dir.exists():
+                    from services.image_semantic_matcher import ImageSemanticIndexer
+                    from utils.file_helpers import is_image_file
+                    img_list = [p for p in job.images_dir.rglob("*") if p.is_file() and is_image_file(p)][:24]
+                    if img_list:
+                        indexer = ImageSemanticIndexer(
+                            gemini_api_key=cfg.gemini_api_key,
+                            project_id=project_id,
+                            project_title=job.title,
+                        )
+                        image_semantics = indexer.index_images(img_list)
 
-                    video_files: list[Path] = []
-                    if job.images_dir.is_file() and is_video_file(job.images_dir):
-                        video_files.append(job.images_dir)
-                    elif job.images_dir.is_dir():
-                        for f in sorted(job.images_dir.iterdir()):
-                            if f.is_file() and is_video_file(f):
-                                video_files.append(f)
+                from services.hybrid_mixer import HybridMediaMixer
+                mixer = HybridMediaMixer(
+                    images_dir=job.images_dir,
+                    videos_path=job.videos_path,
+                    clip_duration=job.clip_duration,
+                    image_ratio=job.image_ratio,
+                    image_semantics=image_semantics,
+                )
+                visual_slots = mixer.create_mix(
+                    total_duration=total_audio_dur if total_audio_dur else 10.0,
+                    transcription=result,
+                )
 
-                    if video_files:
-                        self.job_progress.emit(row_idx, 52, "Detecting video scenes...")
-                        detector = SceneDetectorService(threshold=27.0, min_scene_len_sec=1.5)
-                        all_scenes: list[Scene] = []
-                        for vf in video_files:
-                            if self._is_cancelled:
-                                break
-                            all_scenes.extend(detector.detect_scenes(vf, project_id=project_id, extract_keyframes=True, use_cache=True))
+                total_segs = len(visual_slots)
+                for i, slot in enumerate(visual_slots):
+                    if self._is_cancelled:
+                        break
+                    clip_file = clips_dir / f"clip_{i:03d}.mp4"
 
-                        if all_scenes:
-                            chunker = NarrativeChunker(target_chunk_sec=16.0)
-                            chunks = chunker.chunk_transcription(result)
-                            matcher = SmartSceneMatcher()
-                            matched_chunks = matcher.match_scenes(chunks=chunks, available_scenes=all_scenes, project_id=project_id, prefer_unused=True)
+                    if slot.media_type == "image":
+                        build_ken_burns_clip(
+                            image_path=slot.source_path,
+                            duration=slot.duration,
+                            output_path=clip_file,
+                            resolution=job.resolution,
+                            preset=slot.preset,
+                        )
+                    else:
+                        extract_subclip(
+                            video_path=slot.source_path,
+                            start_sec=slot.subclip_start,
+                            end_sec=slot.subclip_end,
+                            output_path=clip_file,
+                            resolution=job.resolution,
+                            target_duration=slot.duration,
+                            keep_audio=False,
+                        )
+                    clip_paths.append(clip_file)
 
-                            for i, mc in enumerate(matched_chunks):
-                                if self._is_cancelled:
-                                    break
-                                clip_file = clips_dir / f"clip_{i:03d}.mp4"
-                                extract_subclip(
-                                    video_path=mc.scene.video_path,
-                                    start_sec=mc.scene.start_time,
-                                    end_sec=mc.scene.end_time,
-                                    output_path=clip_file,
-                                    resolution=job.resolution,
-                                    target_duration=mc.target_duration,
-                                    keep_audio=False,
-                                )
-                                clip_paths.append(clip_file)
-                                clip_pct = 50 + int((i + 1) / len(matched_chunks) * 35)
-                                self.job_progress.emit(row_idx, min(clip_pct, 85), f"Rendering clip {i + 1}/{len(matched_chunks)}...")
-
-                # Template 1 (Hybrid Images & Video Mix) or fallback if no episode video detected
-                if not clip_paths:
-                    from services.hybrid_mixer import HybridMediaMixer
-                    mixer = HybridMediaMixer(
-                        images_dir=job.images_dir,
-                        videos_path=job.videos_path,
-                        clip_duration=job.clip_duration,
-                        image_ratio=job.image_ratio,
-                    )
-                    visual_slots = mixer.create_mix(
-                        total_duration=total_audio_dur if total_audio_dur else 10.0,
-                        transcription=result,
-                    )
-
-                    total_segs = len(visual_slots)
-                    for i, slot in enumerate(visual_slots):
-                        if self._is_cancelled:
-                            break
-                        clip_file = clips_dir / f"clip_{i:03d}.mp4"
-
-                        if slot.media_type == "image":
-                            build_ken_burns_clip(
-                                image_path=slot.source_path,
-                                duration=slot.duration,
-                                output_path=clip_file,
-                                resolution=job.resolution,
-                                preset=slot.preset,
-                            )
-                        else:
-                            extract_subclip(
-                                video_path=slot.source_path,
-                                start_sec=slot.subclip_start,
-                                end_sec=slot.subclip_end,
-                                output_path=clip_file,
-                                resolution=job.resolution,
-                                target_duration=slot.duration,
-                                keep_audio=False,
-                            )
-                        clip_paths.append(clip_file)
-
-                        clip_pct = 50 + int((i + 1) / total_segs * 35)
-                        self.job_progress.emit(row_idx, min(clip_pct, 85), f"Rendering clip {i + 1}/{total_segs}...")
+                    clip_pct = 50 + int((i + 1) / total_segs * 35)
+                    self.job_progress.emit(row_idx, min(clip_pct, 85), f"Rendering clip {i + 1}/{total_segs}...")
 
                 if self._is_cancelled:
                     break

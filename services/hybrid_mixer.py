@@ -184,12 +184,14 @@ class HybridMediaMixer:
         clip_duration: float = 5.0,
         image_ratio: float = 0.5,
         seed: Optional[int] = None,
+        image_semantics: Optional[dict[Path, Any]] = None,
     ) -> None:
         self.images_dir = Path(images_dir).resolve() if images_dir else None
         self.videos_path = Path(videos_path).resolve() if videos_path else None
         self.clip_duration = max(1.0, min(float(clip_duration), 20.0))
         self.image_ratio = max(0.0, min(float(image_ratio), 1.0))
         self.rng = random.Random(seed)
+        self.image_semantics = image_semantics
 
         self._image_files: list[Path] = []
         self._video_files: list[Path] = []
@@ -203,7 +205,7 @@ class HybridMediaMixer:
         if self.images_dir and self.images_dir.exists():
             if self.images_dir.is_dir():
                 try:
-                    self._char_matcher = CharacterMatcher(self.images_dir)
+                    self._char_matcher = CharacterMatcher(self.images_dir, image_semantics=self.image_semantics)
                     self._image_files = list(self._char_matcher._all_images)
                 except Exception:
                     self._image_files = [
@@ -250,6 +252,7 @@ class HybridMediaMixer:
         total_duration: float,
         transcription: Optional[TranscriptionResult] = None,
         character_assignments: Optional[list[str]] = None,
+        used_images: Optional[set[Path]] = None,
     ) -> list[VisualSlot]:
         """
         Build an interleaved timeline of image and video slots matching `total_duration`.
@@ -259,6 +262,7 @@ class HybridMediaMixer:
         total_duration : Full voiceover audio duration (seconds).
         transcription  : Optional transcription result for speech alignment.
         character_assignments : Optional character name mappings per segment.
+        used_images    : Optional mutable set of image paths already used (for cross-part continuity).
 
         Returns
         -------
@@ -297,7 +301,7 @@ class HybridMediaMixer:
 
         # ── Prepare character matcher / image pool ────────────────────────────
         if self._char_matcher is None and self.images_dir:
-            self._char_matcher = CharacterMatcher(self.images_dir)
+            self._char_matcher = CharacterMatcher(self.images_dir, image_semantics=self.image_semantics)
 
         assignments_image: list = []
         if "image" in slot_types and self._char_matcher and transcription:
@@ -314,6 +318,8 @@ class HybridMediaMixer:
         vid_idx = 0
         last_image: Optional[Path] = None
         last_preset: Optional[KenBurnsPreset] = None
+        if used_images is None:
+            used_images = set()
 
         for idx, (slot_start, slot_dur) in enumerate(raw_intervals):
             stype = slot_types[idx]
@@ -323,11 +329,29 @@ class HybridMediaMixer:
                 chosen_img: Optional[Path] = None
                 char_name = "general"
 
+                # Extract spoken narration for this slot
+                slot_narration = ""
+                if transcription and transcription.segments:
+                    slot_end = slot_start + slot_dur
+                    overlapping = [
+                        seg.text for seg in transcription.segments
+                        if seg.start < slot_end and seg.end > slot_start
+                    ]
+                    if overlapping:
+                        slot_narration = " ".join(overlapping)
+
                 if assignments_image and img_idx < len(assignments_image):
-                    chosen_img = assignments_image[img_idx % len(assignments_image)].image_path
                     char_name = assignments_image[img_idx % len(assignments_image)].character
-                elif self._char_matcher:
-                    chosen_img = self._char_matcher._pick_global_fallback(last_image)
+
+                if self._char_matcher:
+                    chosen_img = self._char_matcher.select_best_image_for_text(
+                        character=char_name,
+                        narration_text=slot_narration,
+                        used_images=used_images,
+                        last_image=last_image,
+                    )
+                elif assignments_image and img_idx < len(assignments_image):
+                    chosen_img = assignments_image[img_idx % len(assignments_image)].image_path
                 elif self._image_files:
                     candidates = [p for p in self._image_files if p != last_image]
                     chosen_img = self.rng.choice(candidates if candidates else self._image_files)
@@ -348,6 +372,7 @@ class HybridMediaMixer:
                         character=char_name,
                     ))
                     last_image = chosen_img
+                    used_images.add(chosen_img)
                     img_idx += 1
                     continue
 

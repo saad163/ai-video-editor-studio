@@ -17,11 +17,34 @@ env/
 
 # Environment secrets
 .env
+.env.*
+
+# Large media folders and video assets (keep local, GitHub blocks files >100MB)
+Audio+Vido/
+Audio+Vido/**
+export oldd/
+export oldd/**
+"export oldd/"
+"export oldd/**"
+movie video and voices/
+movie video and voices/**
+"movie video and voices/"
+"movie video and voices/**"
+assets/sample_footage/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.mp3
+*.wav
+!assets/sfx/*.wav
+sample.mp3
 
 # Project runtime artifacts
-temp/chunks/*
-temp/frames/*
-temp/cache/*
+temp/*
+!temp/.gitkeep
+temp/models/*
+scratch/
 output/*
 *.db
 *.sqlite
