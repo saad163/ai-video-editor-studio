@@ -43,6 +43,8 @@ class InterviewSegment:
     label: str               # Brief topic / summary
     transcript: str = ""     # Transcript text covered in this segment
     speaker: str = "Speaker" # Identified or assigned speaker label
+    interview_score: float = 1.0 # 0.0 to 1.0 visual framing / human presence confidence
+    is_human_verified: bool = True # True if candidate frame verified with face / human presence
 
 
 def format_timestamp_mmss(seconds: float) -> str:
@@ -209,15 +211,60 @@ class InterviewScanner:
         url: str,
         progress_cb: Optional[Callable[[int, str], None]] = None,
         force_redownload: bool = False,
+        filter_mode: str = "strict",
+        use_cache: bool = True,
     ) -> tuple[Path, list[InterviewSegment]]:
         """
         Execute full download, transcription, and segment detection pipeline.
         Returns (downloaded_video_path, list_of_interview_segments).
+
+        Parameters:
+          filter_mode: "strict" (default) or "all" (relaxed, includes all candidate dialogue/scenes).
+          use_cache: True to check/save results in SQLite cache keyed by (video_hash + filter_mode).
         """
         # Step 1: Download or reuse video
         if progress_cb:
             progress_cb(2, f"Initializing scan for video URL...")
         video_path = self.downloader.download(url, progress_cb=progress_cb, force_redownload=force_redownload)
+
+        from utils.file_helpers import compute_file_hash
+        video_hash = compute_file_hash(video_path)
+
+        # Step 1.5: Check SQLite cache
+        if use_cache:
+            from database.db import get_cached_interview_candidates
+            cached_row = get_cached_interview_candidates(video_hash=video_hash, filter_mode=filter_mode)
+            if cached_row and cached_row["segments_json"]:
+                try:
+                    data = json.loads(cached_row["segments_json"])
+                    if isinstance(data, list) and data:
+                        cached_segments = [
+                            InterviewSegment(
+                                segment_id=item["segment_id"],
+                                start_sec=float(item["start_sec"]),
+                                end_sec=float(item["end_sec"]),
+                                duration_sec=float(item["duration_sec"]),
+                                start_time=item["start_time"],
+                                end_time=item["end_time"],
+                                label=item["label"],
+                                transcript=item.get("transcript", ""),
+                                speaker=item.get("speaker", "Speaker"),
+                                interview_score=float(item.get("interview_score", 1.0)),
+                                is_human_verified=bool(item.get("is_human_verified", True)),
+                            )
+                            for item in data
+                        ]
+                        logger.info(
+                            "Cache hit for interview video '%s' (mode=%s) — loaded %d segment(s) from SQLite.",
+                            video_path.name,
+                            filter_mode,
+                            len(cached_segments),
+                        )
+                        if progress_cb:
+                            progress_cb(100, f"Loaded {len(cached_segments)} cached interview segment(s)")
+                        return video_path, cached_segments
+                except Exception as exc:
+                    logger.warning("Failed parsing cached interview segments JSON: %s", exc)
 
         # Step 2: Transcribe via Whisper
         if progress_cb:
@@ -236,10 +283,129 @@ class InterviewScanner:
         # Step 3: Detect Interview Segments (Gemini with Heuristic Fallback)
         detected_segments = self._detect_segments(segments_raw, progress_cb=progress_cb)
 
-        if progress_cb:
-            progress_cb(100, f"Scan complete: {len(detected_segments)} interview segment(s) detected")
+        # Step 4: Visual Frame Human / Interview Verification (Filter non-interview footage)
+        verified_segments = self._verify_segments_framing(
+            video_path=video_path,
+            segments=detected_segments,
+            filter_mode=filter_mode,
+            progress_cb=progress_cb,
+        )
 
-        return video_path, detected_segments
+        # Step 5: Save to SQLite cache
+        if use_cache:
+            try:
+                from database.db import insert_interview_candidates_cache
+                cache_payload = [
+                    {
+                        "segment_id": s.segment_id,
+                        "start_sec": s.start_sec,
+                        "end_sec": s.end_sec,
+                        "duration_sec": s.duration_sec,
+                        "start_time": s.start_time,
+                        "end_time": s.end_time,
+                        "label": s.label,
+                        "transcript": s.transcript,
+                        "speaker": s.speaker,
+                        "interview_score": s.interview_score,
+                        "is_human_verified": s.is_human_verified,
+                    }
+                    for s in verified_segments
+                ]
+                insert_interview_candidates_cache(
+                    video_hash=video_hash,
+                    segments_json=json.dumps(cache_payload, ensure_ascii=False),
+                    filter_mode=filter_mode,
+                    model_used="gemini+cv_verifier",
+                )
+            except Exception as exc:
+                logger.warning("Failed saving interview candidates to SQLite cache: %s", exc)
+
+        if progress_cb:
+            progress_cb(100, f"Scan complete: {len(verified_segments)} interview segment(s) detected")
+
+        return video_path, verified_segments
+
+    def _verify_segments_framing(
+        self,
+        video_path: Path,
+        segments: list[InterviewSegment],
+        filter_mode: str = "strict",
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+    ) -> list[InterviewSegment]:
+        """
+        Sample key frames from each detected candidate segment and score interview-style framing.
+        In strict mode, filters out non-human / B-roll / scenery cuts.
+        In all/relaxed mode, retains all segments with framing scores attached.
+        """
+        if not segments or not video_path.is_file():
+            return list(segments)
+
+        from services.scene_detector import evaluate_interview_framing
+        import cv2
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            logger.warning("Could not open video file %s for interview frame verification", video_path)
+            return list(segments)
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        verified: list[InterviewSegment] = []
+
+        try:
+            for idx, seg in enumerate(segments):
+                if progress_cb:
+                    pct = 85 + int((idx / max(1, len(segments))) * 13)
+                    progress_cb(pct, f"Verifying interview framing for clip #{seg.segment_id}...")
+
+                # Sample up to 2 frames per segment (at 25% and 60% of duration)
+                mid_s1 = seg.start_sec + (seg.duration_sec * 0.25)
+                mid_s2 = seg.start_sec + (seg.duration_sec * 0.60)
+                frame_scores = []
+
+                for sample_s in (mid_s1, mid_s2):
+                    frame_num = int(sample_s * fps)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        res = evaluate_interview_framing(frame)
+                        frame_scores.append(res)
+
+                if frame_scores:
+                    max_score = max(f["score"] for f in frame_scores)
+                    has_human = any(f["is_interview"] or f["score"] >= 0.38 for f in frame_scores)
+                else:
+                    max_score = 1.0
+                    has_human = True
+
+                seg.interview_score = round(float(max_score), 3)
+                seg.is_human_verified = bool(has_human)
+
+                if filter_mode == "strict":
+                    if has_human or max_score >= 0.38:
+                        verified.append(seg)
+                    else:
+                        logger.info(
+                            "Filtering out non-interview candidate #%d ('%s') score=%.2f (no human interview framing)",
+                            seg.segment_id,
+                            seg.label,
+                            max_score,
+                        )
+                else:
+                    # In "all" mode, keep everything
+                    verified.append(seg)
+        finally:
+            cap.release()
+
+        # Safe empty handling: If strict filtering eliminated every segment, log warning and preserve all
+        if not verified and segments:
+            logger.warning("Strict interview filter produced 0 clips; falling back to all candidate segments.")
+            return list(segments)
+
+        # Re-number segment IDs sequentially
+        for new_id, seg in enumerate(verified, start=1):
+            seg.segment_id = new_id
+
+        return verified
 
     def _detect_segments(
         self,
@@ -283,13 +449,15 @@ class InterviewScanner:
 
         prompt = f"""
 You are an expert video editor specializing in interview clips and podcast shorts.
-Analyze the following timestamped video transcript and identify coherent, high-value interview segments, speaker dialogue blocks, or Q&A exchanges.
+Analyze the following timestamped video transcript and identify coherent, high-value interview segments, speaker dialogue blocks, or Q&A exchanges between interviewer/host and interviewee/guest.
 
-GUIDELINES:
-1. Each segment should ideally be between 10 and 60 seconds in duration.
-2. Ensure start_sec and end_sec precisely match natural speech boundaries from the timestamps provided.
-3. Provide a brief, engaging label (5-8 words) summarizing what is discussed.
-4. If recognizable, assign a speaker label (e.g. "Speaker 1", "Guest", "Host").
+CRITICAL FILTERING GUIDELINES:
+1. ONLY select segments containing actual human spoken interview dialogue, Q&A exchanges, guest commentary, or host introductions.
+2. EXCLUDE non-interview content such as background sound, music interludes, sponsor reads, or silent cuts.
+3. Each segment should ideally be between 10 and 60 seconds in duration.
+4. Ensure start_sec and end_sec precisely match natural speech boundaries from the timestamps provided.
+5. Provide a brief, engaging label (5-8 words) summarizing what is discussed.
+6. If recognizable, assign a speaker label (e.g. "Speaker 1", "Guest", "Host").
 
 TRANSCRIPT:
 {transcript_sample}

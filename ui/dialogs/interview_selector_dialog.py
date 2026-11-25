@@ -476,24 +476,25 @@ class CropOverlayWidget(QWidget):
         for px, py in points:
             p.drawRect(px - hs2, py - hs2, handle_size, handle_size)
 
-        # Draw Dimension Pill
+        # Draw Dimension & Mode Pill
         cw = max(64, self.source_width - self.crop_left - self.crop_right)
         ch = max(64, self.source_height - self.crop_top - self.crop_bottom)
-        pill_text = f"✂ {cw} × {ch}"
+        is_cropped = (self.crop_top > 0 or self.crop_bottom > 0 or self.crop_left > 0 or self.crop_right > 0)
+        pill_text = f"✂ Interview Screen Keep Area: {cw} × {ch}" if is_cropped else f"Full Frame: {cw} × {ch}"
         p.setFont(QFont("Segoe UI", 9, QFont.Bold))
         text_rect = p.fontMetrics().boundingRect(pill_text)
-        pill_w = text_rect.width() + 16
-        pill_h = text_rect.height() + 6
+        pill_w = text_rect.width() + 20
+        pill_h = text_rect.height() + 8
         pill_x = cr.center().x() - pill_w // 2
         pill_y = max(vr.top() + 4, cr.top() - pill_h - 4)
         if pill_y < vr.top() + 4:
             pill_y = cr.top() + 6
 
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(18, 18, 22, 220))
-        p.drawRoundedRect(pill_x, pill_y, pill_w, pill_h, 4, 4)
+        p.setBrush(QColor(18, 18, 22, 230))
+        p.drawRoundedRect(pill_x, pill_y, pill_w, pill_h, 5, 5)
 
-        p.setPen(QColor("#FB923C"))
+        p.setPen(QColor("#FB923C") if is_cropped else QColor("#34D399"))
         p.drawText(QRect(pill_x, pill_y, pill_w, pill_h), Qt.AlignCenter, pill_text)
         p.end()
 
@@ -569,6 +570,7 @@ class InterviewSelectorDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.source_video = str(source_video)
+        self._all_segments: list[InterviewSegment] = list(segments or [])
         self.segments = list(segments or [])
         self.confirmed_clips: list[TrimmedInterviewClip] = []
         self._rows: list[_RowControls] = []
@@ -767,6 +769,11 @@ class InterviewSelectorDialog(QDialog):
         header_row.addStretch()
 
         # Selection Toolbar Actions
+        self.chk_show_all_scenes = QCheckBox("Show all scenes")
+        self.chk_show_all_scenes.setToolTip("Toggle to view all detected clips, including those with lower interview framing confidence.")
+        self.chk_show_all_scenes.setStyleSheet("font-size: 11px; color: #94A3B8; margin-right: 6px;")
+        self.chk_show_all_scenes.toggled.connect(self._on_toggle_show_all_scenes)
+
         self.btn_select_all = QPushButton("Select All")
         self.btn_select_all.setObjectName("secondaryButton")
         self.btn_select_all.clicked.connect(self._select_all_clips)
@@ -781,6 +788,7 @@ class InterviewSelectorDialog(QDialog):
             "border-radius: 5px; font-size: 11px; font-weight: 700; padding: 5px 10px;"
         )
 
+        header_row.addWidget(self.chk_show_all_scenes)
         header_row.addWidget(self.btn_select_all)
         header_row.addWidget(self.btn_clear_all)
         header_row.addSpacing(6)
@@ -934,7 +942,7 @@ class InterviewSelectorDialog(QDialog):
         crop_layout.setSpacing(8)
 
         crop_title_row = QHBoxLayout()
-        crop_tag = QLabel("✂ 4-Side Screen Area Crop")
+        crop_tag = QLabel("✂ Interview Screen / Crop Area")
         crop_tag.setStyleSheet("font-size: 11px; font-weight: 700; color: #38BDF8;")
         self.lbl_crop_summary = QLabel("1920×1080 (Full Frame)")
         self.lbl_crop_summary.setStyleSheet(
@@ -946,26 +954,57 @@ class InterviewSelectorDialog(QDialog):
         crop_title_row.addWidget(self.lbl_crop_summary)
         crop_layout.addLayout(crop_title_row)
 
-        # Spinbox grid (Balanced 3-row layout with clear labels)
+        # Quick Framing Preset Buttons Row
+        preset_row = QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.setSpacing(6)
+
+        self.btn_preset_full = QPushButton("Full Frame")
+        self.btn_preset_full.setObjectName("secondaryButton")
+        self.btn_preset_full.setFixedHeight(24)
+        self.btn_preset_full.clicked.connect(lambda: self._apply_framing_preset("full"))
+
+        self.btn_preset_left = QPushButton("Left Speaker")
+        self.btn_preset_left.setObjectName("secondaryButton")
+        self.btn_preset_left.setFixedHeight(24)
+        self.btn_preset_left.clicked.connect(lambda: self._apply_framing_preset("left"))
+
+        self.btn_preset_center = QPushButton("Center Focus")
+        self.btn_preset_center.setObjectName("secondaryButton")
+        self.btn_preset_center.setFixedHeight(24)
+        self.btn_preset_center.clicked.connect(lambda: self._apply_framing_preset("center"))
+
+        self.btn_preset_right = QPushButton("Right Speaker")
+        self.btn_preset_right.setObjectName("secondaryButton")
+        self.btn_preset_right.setFixedHeight(24)
+        self.btn_preset_right.clicked.connect(lambda: self._apply_framing_preset("right"))
+
+        preset_row.addWidget(self.btn_preset_full)
+        preset_row.addWidget(self.btn_preset_left)
+        preset_row.addWidget(self.btn_preset_center)
+        preset_row.addWidget(self.btn_preset_right)
+        crop_layout.addLayout(preset_row)
+
+        # Spinbox grid (Generous, unclipped layout with ample label room)
         grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(8)
-        grid.setContentsMargins(6, 4, 6, 4)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(6)
+        grid.setContentsMargins(4, 2, 4, 2)
 
         # Top
         top_container = QWidget()
         top_box = QHBoxLayout(top_container)
         top_box.setContentsMargins(0, 0, 0, 0)
-        top_box.setSpacing(8)
+        top_box.setSpacing(6)
         top_box.setAlignment(Qt.AlignCenter)
         lbl_top = QLabel("Top:")
-        lbl_top.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 44px;")
+        lbl_top.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 48px;")
         lbl_top.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.spin_crop_top = QSpinBox()
         self.spin_crop_top.setRange(0, 9999)
         self.spin_crop_top.setSingleStep(2)
         self.spin_crop_top.setSuffix(" px")
-        self.spin_crop_top.setFixedWidth(96)
+        self.spin_crop_top.setFixedWidth(100)
         self.spin_crop_top.setFixedHeight(26)
         self.spin_crop_top.valueChanged.connect(self._on_crop_spinbox_changed)
         top_box.addWidget(lbl_top)
@@ -976,16 +1015,16 @@ class InterviewSelectorDialog(QDialog):
         left_container = QWidget()
         left_box = QHBoxLayout(left_container)
         left_box.setContentsMargins(0, 0, 0, 0)
-        left_box.setSpacing(8)
+        left_box.setSpacing(6)
         left_box.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         lbl_left = QLabel("Left:")
-        lbl_left.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 44px;")
+        lbl_left.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 48px;")
         lbl_left.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.spin_crop_left = QSpinBox()
         self.spin_crop_left.setRange(0, 9999)
         self.spin_crop_left.setSingleStep(2)
         self.spin_crop_left.setSuffix(" px")
-        self.spin_crop_left.setFixedWidth(96)
+        self.spin_crop_left.setFixedWidth(100)
         self.spin_crop_left.setFixedHeight(26)
         self.spin_crop_left.valueChanged.connect(self._on_crop_spinbox_changed)
         left_box.addWidget(lbl_left)
@@ -995,16 +1034,16 @@ class InterviewSelectorDialog(QDialog):
         right_container = QWidget()
         right_box = QHBoxLayout(right_container)
         right_box.setContentsMargins(0, 0, 0, 0)
-        right_box.setSpacing(8)
+        right_box.setSpacing(6)
         right_box.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         lbl_right = QLabel("Right:")
-        lbl_right.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 44px;")
+        lbl_right.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 48px;")
         lbl_right.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.spin_crop_right = QSpinBox()
         self.spin_crop_right.setRange(0, 9999)
         self.spin_crop_right.setSingleStep(2)
         self.spin_crop_right.setSuffix(" px")
-        self.spin_crop_right.setFixedWidth(96)
+        self.spin_crop_right.setFixedWidth(100)
         self.spin_crop_right.setFixedHeight(26)
         self.spin_crop_right.valueChanged.connect(self._on_crop_spinbox_changed)
         right_box.addWidget(lbl_right)
@@ -1015,16 +1054,16 @@ class InterviewSelectorDialog(QDialog):
         bot_container = QWidget()
         bot_box = QHBoxLayout(bot_container)
         bot_box.setContentsMargins(0, 0, 0, 0)
-        bot_box.setSpacing(8)
+        bot_box.setSpacing(6)
         bot_box.setAlignment(Qt.AlignCenter)
         lbl_bot = QLabel("Bottom:")
-        lbl_bot.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 44px;")
+        lbl_bot.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 48px;")
         lbl_bot.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.spin_crop_bottom = QSpinBox()
         self.spin_crop_bottom.setRange(0, 9999)
         self.spin_crop_bottom.setSingleStep(2)
         self.spin_crop_bottom.setSuffix(" px")
-        self.spin_crop_bottom.setFixedWidth(96)
+        self.spin_crop_bottom.setFixedWidth(100)
         self.spin_crop_bottom.setFixedHeight(26)
         self.spin_crop_bottom.valueChanged.connect(self._on_crop_spinbox_changed)
         bot_box.addWidget(lbl_bot)
@@ -1036,12 +1075,12 @@ class InterviewSelectorDialog(QDialog):
         # Reset button & hint row
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 4, 0, 0)
-        lbl_crop_hint = QLabel("💡 Drag box or handles on preview to crop out logos/borders")
+        lbl_crop_hint = QLabel("💡 Drag box on video or click presets to crop speaker")
         lbl_crop_hint.setStyleSheet("font-size: 10px; color: #64748B;")
         self.btn_reset_crop = QPushButton("↺ Reset Full Frame")
         self.btn_reset_crop.setObjectName("secondaryButton")
         self.btn_reset_crop.setFixedHeight(26)
-        self.btn_reset_crop.setFixedWidth(140)
+        self.btn_reset_crop.setMinimumWidth(130)
         self.btn_reset_crop.clicked.connect(self._reset_crop)
         btn_row.addWidget(lbl_crop_hint)
         btn_row.addStretch()
@@ -1418,6 +1457,34 @@ class InterviewSelectorDialog(QDialog):
 
         self._update_crop_summary_label()
 
+    def _apply_framing_preset(self, preset: str) -> None:
+        """Apply a framing preset (full, left, center, right) to the active clip."""
+        sw = max(64, self.crop_overlay.source_width)
+        sh = max(64, self.crop_overlay.source_height)
+
+        if preset == "full":
+            self.crop_overlay.reset_crop()
+            self._sync_crop_controls(0, 0, 0, 0)
+        elif preset == "left":
+            # Left speaker: focus on left 55% of width, full height
+            self.crop_overlay.set_crop_from_normalized(norm_x=0.0, norm_y=0.0, norm_w=0.55, norm_h=1.0)
+            t, b, l, r = self.crop_overlay.get_crop()
+            self._sync_crop_controls(t, b, l, r)
+        elif preset == "right":
+            # Right speaker: focus on right 55% of width, full height
+            self.crop_overlay.set_crop_from_normalized(norm_x=0.45, norm_y=0.0, norm_w=0.55, norm_h=1.0)
+            t, b, l, r = self.crop_overlay.get_crop()
+            self._sync_crop_controls(t, b, l, r)
+        elif preset == "center":
+            # Center focus: center 60% width, central 85% height
+            self.crop_overlay.set_crop_from_normalized(norm_x=0.20, norm_y=0.08, norm_w=0.60, norm_h=0.84)
+            t, b, l, r = self.crop_overlay.get_crop()
+            self._sync_crop_controls(t, b, l, r)
+
+        if self._active_preview_row_idx is not None and self._active_preview_row_idx < len(self._rows):
+            row = self._rows[self._active_preview_row_idx]
+            row.crop_top, row.crop_bottom, row.crop_left, row.crop_right = self.crop_overlay.get_crop()
+
     def _reset_crop(self) -> None:
         self._sync_crop_controls(0, 0, 0, 0)
         if self._active_preview_row_idx is not None and self._active_preview_row_idx < len(self._rows):
@@ -1621,6 +1688,27 @@ class InterviewSelectorDialog(QDialog):
                     overlaps.append((id_a, id_b))
 
         return overlaps
+
+    def _on_toggle_show_all_scenes(self, checked: bool) -> None:
+        """Filter table rows by interview confidence or show all detected scenes."""
+        self._apply_scene_filter(checked)
+
+    def _apply_scene_filter(self, show_all: bool) -> None:
+        """Apply active scene filter based on interview framing confidence."""
+        if show_all:
+            self.segments = list(self._all_segments)
+        else:
+            # Filter to clips meeting interview confidence and verified human presence
+            filtered = [
+                s for s in self._all_segments
+                if getattr(s, "is_human_verified", True) and getattr(s, "interview_score", 1.0) >= 0.38
+            ]
+            self.segments = filtered if filtered else list(self._all_segments)
+
+        self._populate_table()
+        self._update_summary_and_validation()
+        if self._rows:
+            self._load_clip_for_preview(0)
 
     def _select_all_clips(self) -> None:
         for row in self._rows:

@@ -152,6 +152,22 @@ CREATE INDEX IF NOT EXISTS idx_scene_match_cache_lookup
     ON scene_match_cache(voiceover_hash, video_hash, template_mode);
 """
 
+_DDL_INTERVIEW_CANDIDATES_CACHE = """
+CREATE TABLE IF NOT EXISTS interview_candidates_cache (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_hash     TEXT    NOT NULL,
+    filter_mode    TEXT    NOT NULL DEFAULT 'strict',
+    segments_json  TEXT    NOT NULL,
+    model_used     TEXT    NOT NULL DEFAULT '',
+    created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+"""
+
+_DDL_INTERVIEW_CANDIDATES_CACHE_IDX = """
+CREATE INDEX IF NOT EXISTS idx_interview_candidates_cache
+    ON interview_candidates_cache(video_hash, filter_mode);
+"""
+
 _ALL_DDL = [
     _DDL_PROJECTS,
     _DDL_MEDIA_ASSETS,
@@ -166,6 +182,8 @@ _ALL_DDL = [
     _DDL_IMAGE_SEMANTIC_CACHE_IDX,
     _DDL_SCENE_MATCH_CACHE,
     _DDL_SCENE_MATCH_CACHE_IDX,
+    _DDL_INTERVIEW_CANDIDATES_CACHE,
+    _DDL_INTERVIEW_CANDIDATES_CACHE_IDX,
 ]
 
 
@@ -381,6 +399,41 @@ def insert_scene_match_cache(
                (voiceover_hash, video_hash, template_mode, matches_json, model_used)
                VALUES (?, ?, ?, ?, ?)""",
             (voiceover_hash, video_hash, template_mode, matches_json, model_used),
+        )
+        conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+
+def get_cached_interview_candidates(
+    video_hash: str,
+    filter_mode: str = "strict",
+) -> sqlite3.Row | None:
+    """
+    Fetch cached interview segment candidates for given video hash and filter mode.
+    Keyed properly by (video_hash + filter_mode) so toggling strict/relax returns accurate results.
+    """
+    with get_connection() as conn:
+        return conn.execute(
+            """SELECT * FROM interview_candidates_cache
+               WHERE video_hash = ? AND filter_mode = ?
+               ORDER BY created_at DESC LIMIT 1""",
+            (video_hash, filter_mode),
+        ).fetchone()
+
+
+def insert_interview_candidates_cache(
+    video_hash: str,
+    segments_json: str,
+    filter_mode: str = "strict",
+    model_used: str = "",
+) -> int:
+    """Store scanned interview candidate segments in persistent SQLite cache."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO interview_candidates_cache
+               (video_hash, filter_mode, segments_json, model_used)
+               VALUES (?, ?, ?, ?)""",
+            (video_hash, filter_mode, segments_json, model_used),
         )
         conn.commit()
         return cur.lastrowid  # type: ignore[return-value]

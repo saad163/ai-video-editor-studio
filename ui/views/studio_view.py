@@ -651,6 +651,10 @@ class StudioView(QWidget):
         self.edit_youtube_link = QLineEdit()
         self.edit_youtube_link.setPlaceholderText("Paste YouTube link (e.g. https://www.youtube.co...")
 
+        self.chk_interview_relax_filter = QCheckBox("Include all scenes")
+        self.chk_interview_relax_filter.setToolTip("Disable strict face/interview filtering and include all detected video scenes/cuts.")
+        self.chk_interview_relax_filter.setStyleSheet("font-size: 11px; color: #94A3B8;")
+
         self.btn_scan_youtube = QPushButton("Scan Clips")
         self.btn_scan_youtube.setFixedHeight(30)
         self.btn_scan_youtube.setStyleSheet(
@@ -659,6 +663,7 @@ class StudioView(QWidget):
         self.btn_scan_youtube.clicked.connect(self._on_scan_youtube_clicked)
 
         yt_row.addWidget(self.edit_youtube_link, stretch=1)
+        yt_row.addWidget(self.chk_interview_relax_filter)
         yt_row.addWidget(self.btn_scan_youtube)
         box_clips_layout.addLayout(yt_row)
 
@@ -2002,7 +2007,8 @@ class StudioView(QWidget):
 
         from ui.workers.interview_scan_worker import InterviewScanWorker
         api_key = os.getenv("GEMINI_API_KEY")
-        self._scan_worker = InterviewScanWorker(url=url, api_key=api_key)
+        filter_mode = "all" if getattr(self, "chk_interview_relax_filter", None) and self.chk_interview_relax_filter.isChecked() else "strict"
+        self._scan_worker = InterviewScanWorker(url=url, api_key=api_key, filter_mode=filter_mode)
         self._scan_worker.progress.connect(self._on_interview_scan_progress)
         self._scan_worker.status_message.connect(self._on_interview_scan_status_message)
         self._scan_worker.scan_finished.connect(self._on_interview_scan_finished)

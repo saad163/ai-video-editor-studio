@@ -560,3 +560,60 @@ def test_interview_compiler_person_segmentation_compositing(mock_video_file, tmp
     assert "boxblur=20" in cmd_str
     assert "overlay=" in cmd_str
 
+
+def test_dialog_framing_presets_and_unclipped_layout(qtbot, sample_segments):
+    """Verify quick framing preset buttons and unclipped dimensions in crop studio dialog."""
+    dlg = InterviewSelectorDialog(
+        source_video="C:/videos/test.mp4",
+        segments=sample_segments,
+    )
+    qtbot.addWidget(dlg)
+    dlg.show()
+
+    # Verify preset buttons exist
+    assert hasattr(dlg, "btn_preset_full")
+    assert hasattr(dlg, "btn_preset_left")
+    assert hasattr(dlg, "btn_preset_center")
+    assert hasattr(dlg, "btn_preset_right")
+
+    # Verify generous spinbox dimensions to avoid clipping
+    assert dlg.spin_crop_top.width() >= 96
+    assert dlg.spin_crop_bottom.width() >= 96
+    assert dlg.spin_crop_left.width() >= 96
+    assert dlg.spin_crop_right.width() >= 96
+    assert dlg.btn_reset_crop.minimumWidth() >= 130
+
+    # 1. Click Left Speaker preset
+    dlg.btn_preset_left.click()
+    t, b, l, r = dlg.crop_overlay.get_crop()
+    # Left speaker preset should keep left side and crop right side
+    assert l == 0
+    assert r > 0
+    assert dlg.spin_crop_left.value() == 0
+    assert dlg.spin_crop_right.value() > 0
+
+    # 2. Click Right Speaker preset
+    dlg.btn_preset_right.click()
+    t, b, l, r = dlg.crop_overlay.get_crop()
+    assert l > 0
+    assert r == 0
+    assert dlg.spin_crop_left.value() > 0
+    assert dlg.spin_crop_right.value() == 0
+
+    # 3. Click Center Focus preset
+    dlg.btn_preset_center.click()
+    t, b, l, r = dlg.crop_overlay.get_crop()
+    assert l > 0 and r > 0
+    assert dlg.spin_crop_left.value() > 0
+    assert dlg.spin_crop_right.value() > 0
+
+    # 4. Click Full Frame preset
+    dlg.btn_preset_full.click()
+    t, b, l, r = dlg.crop_overlay.get_crop()
+    assert (t, b, l, r) == (0, 0, 0, 0)
+    assert dlg.spin_crop_top.value() == 0
+    assert dlg.spin_crop_bottom.value() == 0
+    assert dlg.spin_crop_left.value() == 0
+    assert dlg.spin_crop_right.value() == 0
+
+

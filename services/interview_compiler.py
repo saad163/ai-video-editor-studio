@@ -583,6 +583,13 @@ class InterviewCompiler:
         bg_removal = bool(cfg_interview.get("bg_removal", True))
         person_mask_path: Optional[Path] = None
         if has_bg_image and bg_removal:
+            logger.info(
+                "Triggering neural person background removal for interview clip %s (bg_image='%s', blur=%d, crop='%s')",
+                prefix,
+                bg_image_path.name if bg_image_path else "None",
+                blur_amount,
+                crop_filt or "none",
+            )
             try:
                 from services.interview_segmenter import generate_person_mask_video
                 p_mask = temp_dir / f"{prefix}_person_mask.mp4"
@@ -598,9 +605,14 @@ class InterviewCompiler:
                 )
                 if res_mask and p_mask.exists():
                     person_mask_path = p_mask
+                    logger.info("Successfully generated person alpha mask video: %s (%.1f KB)", p_mask.name, p_mask.stat().st_size / 1024)
+                else:
+                    logger.warning("Person segmentation returned no output mask for %s; will composite frame directly", prefix)
             except Exception as exc:
                 logger.warning("Person segmentation could not be computed for %s, falling back: %s", prefix, exc)
                 person_mask_path = None
+        elif not has_bg_image:
+            logger.info("No custom background image provided for clip %s; using original clip framing", prefix)
 
         # Input tracking
         extra_inputs = []

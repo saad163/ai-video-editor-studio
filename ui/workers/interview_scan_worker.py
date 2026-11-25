@@ -34,16 +34,20 @@ class InterviewScanWorker(QThread):
         url: str,
         api_key: Optional[str] = None,
         force_redownload: bool = False,
+        filter_mode: str = "strict",
+        use_cache: bool = True,
     ) -> None:
         super().__init__()
         self.url = url.strip()
         self.api_key = api_key
         self.force_redownload = force_redownload
+        self.filter_mode = filter_mode
+        self.use_cache = use_cache
         self.scanner = InterviewScanner(api_key=api_key)
 
     def run(self) -> None:
         """Run download and scan pipeline on worker thread."""
-        logger.info("Starting InterviewScanWorker for URL: %s", self.url)
+        logger.info("Starting InterviewScanWorker for URL: %s (filter_mode=%s)", self.url, self.filter_mode)
         self.status_message.emit("Connecting to video source...")
         self.progress.emit(5)
 
@@ -56,12 +60,15 @@ class InterviewScanWorker(QThread):
                 url=self.url,
                 progress_cb=_progress_callback,
                 force_redownload=self.force_redownload,
+                filter_mode=self.filter_mode,
+                use_cache=self.use_cache,
             )
 
             logger.info(
-                "InterviewScanWorker succeeded: %s (%d segments detected)",
+                "InterviewScanWorker succeeded: %s (%d segments detected, mode=%s)",
                 video_path.name,
                 len(segments),
+                self.filter_mode,
             )
             self.progress.emit(100)
             self.status_message.emit(f"Scan complete: {len(segments)} interview segment(s) ready.")

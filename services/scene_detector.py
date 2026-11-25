@@ -56,10 +56,108 @@ class Scene:
     keyframe_path: Optional[Path] = None
     description: str = ""
     used_count: int = 0
+    is_interview: bool = False
+    interview_score: float = 0.0
 
     @property
     def label(self) -> str:
         return f"Scene {self.scene_index:03d} [{self.start_sec:.1f}s - {self.end_sec:.1f}s ({self.duration_sec:.1f}s)]"
+
+
+def evaluate_interview_framing(frame_bgr: "cv2.typing.MatLike | np.ndarray", rembg_session: Any = None) -> dict[str, Any]:
+    """
+    Evaluate human / face presence and interview-style framing in a video frame.
+
+    Interview framing criteria:
+      - Visible human face / upper body in upper-middle framing (1-person or 2-person host/guest).
+      - Moderate human area coverage (typically 6% to 75% of screen area).
+      - Distinguishes human subjects from distant scenery, landscape, or non-human cuts.
+
+    Returns dict with keys:
+      - is_interview (bool): True if frame matches interview framing criteria.
+      - score (float): 0.0 to 1.0 confidence score.
+      - face_count (int): Number of detected face/head candidates.
+      - face_coverage (float): Ratio of face area to total frame area.
+      - human_coverage (float): Estimated human body coverage.
+    """
+    if frame_bgr is None or not hasattr(frame_bgr, "shape") or len(frame_bgr.shape) < 2:
+        return {"is_interview": False, "score": 0.0, "face_count": 0, "face_coverage": 0.0, "human_coverage": 0.0}
+
+    # Resize to standardized evaluation resolution for high speed
+    eval_w, eval_h = 320, 180
+    small = cv2.resize(frame_bgr, (eval_w, eval_h))
+    total_px = eval_w * eval_h
+
+    # 1. Skin-tone detection in YCrCb color space
+    ycrcb = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
+    skin_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
+
+    # 2. Contour analysis for face/head bounding boxes
+    contours, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    face_candidates = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area >= (total_px * 0.005):  # At least 0.5% of frame
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            aspect = bh / max(1, bw)
+            bbox_area = bw * bh
+
+            # Faces / upper heads typically have aspect ratio 0.5 to 3.2 and are not entire screen
+            if 0.5 <= aspect <= 3.2 and bbox_area < (total_px * 0.70):
+                cy = y + (bh // 2)
+                # Face center usually in upper 85% of frame (not solely feet/floor)
+                if cy <= int(eval_h * 0.85):
+                    face_candidates.append({
+                        "bbox": (x, y, bw, bh),
+                        "area": area,
+                        "aspect": aspect,
+                        "center": (x + bw // 2, cy),
+                    })
+
+    face_count = len(face_candidates)
+    total_face_area = sum(f["area"] for f in face_candidates)
+    face_coverage = total_face_area / total_px
+
+    # 3. Neural person matting verification if rembg_session provided
+    human_coverage = 0.0
+    if rembg_session is not None:
+        try:
+            from PIL import Image
+            import rembg
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            mask = rembg.remove(Image.fromarray(rgb), session=rembg_session, only_mask=True)
+            m_arr = np.array(mask)
+            human_coverage = float(np.count_nonzero(m_arr > 50) / total_px)
+        except Exception as exc:
+            logger.debug("Neural matting fallback in interview evaluation: %s", exc)
+            human_coverage = min(0.65, face_coverage * 3.5)
+    else:
+        human_coverage = min(0.65, face_coverage * 3.5)
+
+    # 4. Composite Interview Framing Score
+    score = 0.0
+    is_interview = False
+
+    if face_count >= 1:
+        # 1-person close-up/medium shot or 2-person host/guest setup
+        face_score = min(1.0, face_coverage / 0.03) * 0.45
+        pos_score = 0.25 if all(f["center"][1] <= int(eval_h * 0.75) for f in face_candidates) else 0.10
+        body_score = min(1.0, human_coverage / 0.15) * 0.30 if human_coverage > 0 else 0.15
+        score = face_score + pos_score + body_score
+        is_interview = bool(score >= 0.38 and face_coverage >= 0.007)
+    elif human_coverage >= 0.12:
+        # Person visible (e.g. turned head or side profile)
+        score = min(0.65, human_coverage * 2.0)
+        is_interview = bool(score >= 0.42)
+
+    return {
+        "is_interview": is_interview,
+        "score": round(float(score), 3),
+        "face_count": face_count,
+        "face_coverage": round(float(face_coverage), 4),
+        "human_coverage": round(float(human_coverage), 4),
+    }
 
 
 class SceneDetectorService:
@@ -215,8 +313,50 @@ class SceneDetectorService:
                 duration_sec=video.duration.get_seconds(),
             )
 
-        logger.info("Persisted %d scenes with keyframes to database.", len(scenes))
-        return scenes
+    def filter_interview_scenes(
+        self,
+        scenes: list[Scene],
+        min_score: float = 0.38,
+        relax_if_empty: bool = True,
+    ) -> list[Scene]:
+        """
+        Filter a list of detected scenes down to interview-style candidate scenes
+        (person / talking / host-guest framing).
+
+        If relax_if_empty is True and no scenes pass the threshold, returns all scenes
+        gracefully so the pipeline never crashes.
+        """
+        if not scenes:
+            return []
+
+        interview_scenes: list[Scene] = []
+        for s in scenes:
+            # If scene already evaluated
+            if s.is_interview:
+                interview_scenes.append(s)
+                continue
+
+            # Evaluate keyframe if available
+            if s.keyframe_path and Path(s.keyframe_path).is_file():
+                try:
+                    frame = cv2.imread(str(s.keyframe_path))
+                    eval_res = evaluate_interview_framing(frame)
+                    s.is_interview = eval_res["is_interview"]
+                    s.interview_score = eval_res["score"]
+                    if eval_res["is_interview"] or eval_res["score"] >= min_score:
+                        interview_scenes.append(s)
+                except Exception as exc:
+                    logger.debug("Failed evaluating scene %d keyframe for interview framing: %s", s.scene_index, exc)
+            else:
+                # If no keyframe, treat as neutral
+                if not s.is_interview and s.interview_score >= min_score:
+                    interview_scenes.append(s)
+
+        if not interview_scenes and relax_if_empty:
+            logger.info("No interview scenes met threshold %.2f; relaxing filter to return all %d scene(s).", min_score, len(scenes))
+            return list(scenes)
+
+        return interview_scenes
 
 
 if __name__ == "__main__":
