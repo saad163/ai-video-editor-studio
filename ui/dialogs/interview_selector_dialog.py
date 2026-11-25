@@ -644,7 +644,7 @@ class InterviewSelectorDialog(QDialog):
                 color: #F4F4F5;
                 font-size: 11px;
                 font-weight: 600;
-                padding: 2px 6px;
+                padding: 2px 4px;
                 min-height: 26px;
             }
             QDoubleSpinBox:focus, QSpinBox:focus {
@@ -654,7 +654,7 @@ class InterviewSelectorDialog(QDialog):
             QDoubleSpinBox::up-button, QSpinBox::up-button {
                 subcontrol-origin: border;
                 subcontrol-position: top right;
-                width: 18px;
+                width: 17px;
                 border-left: 1px solid #3F3F46;
                 border-top-right-radius: 5px;
                 background-color: #26262E;
@@ -662,7 +662,7 @@ class InterviewSelectorDialog(QDialog):
             QDoubleSpinBox::down-button, QSpinBox::down-button {
                 subcontrol-origin: border;
                 subcontrol-position: bottom right;
-                width: 18px;
+                width: 17px;
                 border-left: 1px solid #3F3F46;
                 border-bottom-right-radius: 5px;
                 background-color: #26262E;
@@ -711,6 +711,19 @@ class InterviewSelectorDialog(QDialog):
                 background-color: #EA580C;
                 border-color: #F97316;
             }
+            QPushButton {
+                background-color: #22222A;
+                color: #E4E4E7;
+                border: 1px solid #3F3F46;
+                border-radius: 6px;
+                font-weight: 600;
+                font-size: 11px;
+                padding: 3px 10px;
+            }
+            QPushButton:hover {
+                background-color: #2C2C36;
+                border-color: #71717A;
+            }
             QPushButton#secondaryButton {
                 background-color: #22222A;
                 color: #E4E4E7;
@@ -718,11 +731,82 @@ class InterviewSelectorDialog(QDialog):
                 border-radius: 6px;
                 font-weight: 600;
                 font-size: 11px;
-                padding: 4px 12px;
+                padding: 3px 10px;
             }
             QPushButton#secondaryButton:hover {
                 background-color: #2C2C36;
                 border-color: #71717A;
+            }
+            QFrame#rightPane {
+                background-color: #15151A;
+                border: 1px solid #27272A;
+                border-radius: 8px;
+            }
+            QFrame#transportDock {
+                background-color: #181820;
+                border: 1px solid #27272A;
+                border-radius: 6px;
+            }
+            QFrame#cropBox {
+                background-color: #181820;
+                border: 1px solid #27272A;
+                border-radius: 6px;
+            }
+            QLabel#cropLabel {
+                color: #94A3B8;
+                font-size: 11px;
+                font-weight: 600;
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+            QSpinBox#cropSpinBox {
+                background-color: #18181D;
+                border: 1px solid #3F3F46;
+                border-radius: 5px;
+                color: #F4F4F5;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 2px 4px;
+                min-height: 24px;
+            }
+            QSpinBox#cropSpinBox:focus {
+                border: 1px solid #38BDF8;
+                background-color: #202028;
+            }
+            QPushButton#presetButton {
+                background-color: #1E293B;
+                color: #E2E8F0;
+                border: 1px solid #334155;
+                border-radius: 5px;
+                font-weight: 700;
+                font-size: 11px;
+                padding: 3px 8px;
+                min-height: 24px;
+            }
+            QPushButton#presetButton:hover {
+                background-color: #0284C7;
+                color: #FFFFFF;
+                border-color: #38BDF8;
+            }
+            QPushButton#presetButton:pressed {
+                background-color: #0369A1;
+                color: #FFFFFF;
+            }
+            QPushButton#btnResetCrop {
+                background-color: #22222A;
+                color: #E4E4E7;
+                border: 1px solid #3F3F46;
+                border-radius: 5px;
+                font-weight: 600;
+                font-size: 11px;
+                padding: 3px 12px;
+                min-height: 26px;
+            }
+            QPushButton#btnResetCrop:hover {
+                background-color: #2C2C36;
+                border-color: #38BDF8;
+                color: #38BDF8;
             }
             QPushButton#primaryButton {
                 background-color: #EA580C;
@@ -827,10 +911,10 @@ class InterviewSelectorDialog(QDialog):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
 
         self.table.setColumnWidth(0, 65)
-        self.table.setColumnWidth(2, 125)
-        self.table.setColumnWidth(3, 125)
+        self.table.setColumnWidth(2, 120)
+        self.table.setColumnWidth(3, 120)
         self.table.setColumnWidth(4, 140)
-        self.table.setColumnWidth(5, 175)
+        self.table.setColumnWidth(5, 168)
 
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
@@ -860,10 +944,10 @@ class InterviewSelectorDialog(QDialog):
 
         # ── Right Pane: View Clip Player & 4-Side Crop Studio ─────────────────
         right_pane = QFrame()
-        right_pane.setStyleSheet("background-color: #15151A; border: 1px solid #27272A; border-radius: 8px; padding: 10px;")
+        right_pane.setObjectName("rightPane")
         right_layout = QVBoxLayout(right_pane)
         right_layout.setContentsMargins(10, 10, 10, 10)
-        right_layout.setSpacing(10)
+        right_layout.setSpacing(8)
 
         # Preview Header (Title & Active Range)
         preview_header = QVBoxLayout()
@@ -888,15 +972,16 @@ class InterviewSelectorDialog(QDialog):
         self.crop_overlay.cropChanged.connect(self._on_crop_overlay_changed)
 
         self.video_container = VideoPreviewCropContainer(self.video_widget, self.crop_overlay)
-        self.video_container.setMinimumHeight(260)
+        self.video_container.setMinimumHeight(170)
         right_layout.addWidget(self.video_container, stretch=1)
 
         # Media Player Transport Controls (2-Row Layout: Scrubber on Top, Buttons Below)
         transport_dock = QFrame()
-        transport_dock.setStyleSheet("background-color: #181820; border: 1px solid #27272A; border-radius: 6px; padding: 6px 10px;")
+        transport_dock.setObjectName("transportDock")
+        transport_dock.setFixedHeight(64)
         transport_layout = QVBoxLayout(transport_dock)
-        transport_layout.setContentsMargins(6, 6, 6, 6)
-        transport_layout.setSpacing(6)
+        transport_layout.setContentsMargins(6, 4, 6, 4)
+        transport_layout.setSpacing(4)
 
         self.slider_seek = QSlider(Qt.Horizontal)
         self.slider_seek.setRange(0, 1000)
@@ -932,14 +1017,15 @@ class InterviewSelectorDialog(QDialog):
         controls_row.addWidget(self.chk_loop)
         transport_layout.addLayout(controls_row)
 
-        right_layout.addWidget(transport_dock)
+        right_layout.addWidget(transport_dock, stretch=0)
 
         # ── 4-Side Screen Area / Crop Margins Controls ────────────────────────
         crop_box = QFrame()
-        crop_box.setStyleSheet("background-color: #181820; border: 1px solid #27272A; border-radius: 6px; padding: 10px 12px;")
+        crop_box.setObjectName("cropBox")
+        crop_box.setFixedHeight(210)
         crop_layout = QVBoxLayout(crop_box)
         crop_layout.setContentsMargins(10, 8, 10, 8)
-        crop_layout.setSpacing(8)
+        crop_layout.setSpacing(6)
 
         crop_title_row = QHBoxLayout()
         crop_tag = QLabel("✂ Interview Screen / Crop Area")
@@ -960,22 +1046,22 @@ class InterviewSelectorDialog(QDialog):
         preset_row.setSpacing(6)
 
         self.btn_preset_full = QPushButton("Full Frame")
-        self.btn_preset_full.setObjectName("secondaryButton")
+        self.btn_preset_full.setObjectName("presetButton")
         self.btn_preset_full.setFixedHeight(24)
         self.btn_preset_full.clicked.connect(lambda: self._apply_framing_preset("full"))
 
         self.btn_preset_left = QPushButton("Left Speaker")
-        self.btn_preset_left.setObjectName("secondaryButton")
+        self.btn_preset_left.setObjectName("presetButton")
         self.btn_preset_left.setFixedHeight(24)
         self.btn_preset_left.clicked.connect(lambda: self._apply_framing_preset("left"))
 
         self.btn_preset_center = QPushButton("Center Focus")
-        self.btn_preset_center.setObjectName("secondaryButton")
+        self.btn_preset_center.setObjectName("presetButton")
         self.btn_preset_center.setFixedHeight(24)
         self.btn_preset_center.clicked.connect(lambda: self._apply_framing_preset("center"))
 
         self.btn_preset_right = QPushButton("Right Speaker")
-        self.btn_preset_right.setObjectName("secondaryButton")
+        self.btn_preset_right.setObjectName("presetButton")
         self.btn_preset_right.setFixedHeight(24)
         self.btn_preset_right.clicked.connect(lambda: self._apply_framing_preset("right"))
 
@@ -985,100 +1071,92 @@ class InterviewSelectorDialog(QDialog):
         preset_row.addWidget(self.btn_preset_right)
         crop_layout.addLayout(preset_row)
 
-        # Spinbox grid (Generous, unclipped layout with ample label room)
+        # Spinbox grid (Generous, unclipped layout directly placed in grid)
         grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(6)
-        grid.setContentsMargins(4, 2, 4, 2)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(4)
+        grid.setContentsMargins(2, 2, 2, 2)
 
         # Top
-        top_container = QWidget()
-        top_box = QHBoxLayout(top_container)
+        top_box = QHBoxLayout()
         top_box.setContentsMargins(0, 0, 0, 0)
         top_box.setSpacing(6)
-        top_box.setAlignment(Qt.AlignCenter)
         lbl_top = QLabel("Top:")
-        lbl_top.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 48px;")
+        lbl_top.setObjectName("cropLabel")
+        lbl_top.setMinimumWidth(44)
         lbl_top.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.spin_crop_top = QSpinBox()
+        self.spin_crop_top.setObjectName("cropSpinBox")
         self.spin_crop_top.setRange(0, 9999)
         self.spin_crop_top.setSingleStep(2)
         self.spin_crop_top.setSuffix(" px")
-        self.spin_crop_top.setFixedWidth(100)
+        self.spin_crop_top.setFixedWidth(98)
         self.spin_crop_top.setFixedHeight(26)
         self.spin_crop_top.valueChanged.connect(self._on_crop_spinbox_changed)
         top_box.addWidget(lbl_top)
         top_box.addWidget(self.spin_crop_top)
-        grid.addWidget(top_container, 0, 0, 1, 2, Qt.AlignCenter)
+        grid.addLayout(top_box, 0, 0, 1, 4, Qt.AlignCenter)
 
         # Left & Right
-        left_container = QWidget()
-        left_box = QHBoxLayout(left_container)
-        left_box.setContentsMargins(0, 0, 0, 0)
-        left_box.setSpacing(6)
-        left_box.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         lbl_left = QLabel("Left:")
-        lbl_left.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 48px;")
+        lbl_left.setObjectName("cropLabel")
+        lbl_left.setMinimumWidth(44)
         lbl_left.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.spin_crop_left = QSpinBox()
+        self.spin_crop_left.setObjectName("cropSpinBox")
         self.spin_crop_left.setRange(0, 9999)
         self.spin_crop_left.setSingleStep(2)
         self.spin_crop_left.setSuffix(" px")
-        self.spin_crop_left.setFixedWidth(100)
+        self.spin_crop_left.setFixedWidth(98)
         self.spin_crop_left.setFixedHeight(26)
         self.spin_crop_left.valueChanged.connect(self._on_crop_spinbox_changed)
-        left_box.addWidget(lbl_left)
-        left_box.addWidget(self.spin_crop_left)
-        grid.addWidget(left_container, 1, 0, Qt.AlignLeft)
+        grid.addWidget(lbl_left, 1, 0, Qt.AlignRight | Qt.AlignVCenter)
+        grid.addWidget(self.spin_crop_left, 1, 1, Qt.AlignLeft | Qt.AlignVCenter)
 
-        right_container = QWidget()
-        right_box = QHBoxLayout(right_container)
-        right_box.setContentsMargins(0, 0, 0, 0)
-        right_box.setSpacing(6)
-        right_box.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         lbl_right = QLabel("Right:")
-        lbl_right.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 48px;")
+        lbl_right.setObjectName("cropLabel")
+        lbl_right.setMinimumWidth(44)
         lbl_right.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.spin_crop_right = QSpinBox()
+        self.spin_crop_right.setObjectName("cropSpinBox")
         self.spin_crop_right.setRange(0, 9999)
         self.spin_crop_right.setSingleStep(2)
         self.spin_crop_right.setSuffix(" px")
-        self.spin_crop_right.setFixedWidth(100)
+        self.spin_crop_right.setFixedWidth(98)
         self.spin_crop_right.setFixedHeight(26)
         self.spin_crop_right.valueChanged.connect(self._on_crop_spinbox_changed)
-        right_box.addWidget(lbl_right)
-        right_box.addWidget(self.spin_crop_right)
-        grid.addWidget(right_container, 1, 1, Qt.AlignRight)
+        grid.addWidget(lbl_right, 1, 2, Qt.AlignRight | Qt.AlignVCenter)
+        grid.addWidget(self.spin_crop_right, 1, 3, Qt.AlignLeft | Qt.AlignVCenter)
 
         # Bottom
-        bot_container = QWidget()
-        bot_box = QHBoxLayout(bot_container)
+        bot_box = QHBoxLayout()
         bot_box.setContentsMargins(0, 0, 0, 0)
         bot_box.setSpacing(6)
-        bot_box.setAlignment(Qt.AlignCenter)
         lbl_bot = QLabel("Bottom:")
-        lbl_bot.setStyleSheet("font-size: 11px; font-weight: 600; color: #94A3B8; min-width: 48px;")
+        lbl_bot.setObjectName("cropLabel")
+        lbl_bot.setMinimumWidth(44)
         lbl_bot.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.spin_crop_bottom = QSpinBox()
+        self.spin_crop_bottom.setObjectName("cropSpinBox")
         self.spin_crop_bottom.setRange(0, 9999)
         self.spin_crop_bottom.setSingleStep(2)
         self.spin_crop_bottom.setSuffix(" px")
-        self.spin_crop_bottom.setFixedWidth(100)
+        self.spin_crop_bottom.setFixedWidth(98)
         self.spin_crop_bottom.setFixedHeight(26)
         self.spin_crop_bottom.valueChanged.connect(self._on_crop_spinbox_changed)
         bot_box.addWidget(lbl_bot)
         bot_box.addWidget(self.spin_crop_bottom)
-        grid.addWidget(bot_container, 2, 0, 1, 2, Qt.AlignCenter)
+        grid.addLayout(bot_box, 2, 0, 1, 4, Qt.AlignCenter)
 
         crop_layout.addLayout(grid)
 
         # Reset button & hint row
         btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(0, 4, 0, 0)
+        btn_row.setContentsMargins(0, 2, 0, 0)
         lbl_crop_hint = QLabel("💡 Drag box on video or click presets to crop speaker")
         lbl_crop_hint.setStyleSheet("font-size: 10px; color: #64748B;")
         self.btn_reset_crop = QPushButton("↺ Reset Full Frame")
-        self.btn_reset_crop.setObjectName("secondaryButton")
+        self.btn_reset_crop.setObjectName("btnResetCrop")
         self.btn_reset_crop.setFixedHeight(26)
         self.btn_reset_crop.setMinimumWidth(130)
         self.btn_reset_crop.clicked.connect(self._reset_crop)
@@ -1087,12 +1165,12 @@ class InterviewSelectorDialog(QDialog):
         btn_row.addWidget(self.btn_reset_crop)
         crop_layout.addLayout(btn_row)
 
-        right_layout.addWidget(crop_box)
+        right_layout.addWidget(crop_box, stretch=0)
 
         self.splitter.addWidget(right_pane)
-        self.splitter.setStretchFactor(0, 5)
-        self.splitter.setStretchFactor(1, 3)
-        self.splitter.setSizes([900, 480])
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setSizes([900, 520])
         root_layout.addWidget(self.splitter, stretch=1)
 
         # ── Bottom Actions ───────────────────────────────────────────────────
@@ -1102,10 +1180,13 @@ class InterviewSelectorDialog(QDialog):
 
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setObjectName("secondaryButton")
+        self.btn_cancel.setFixedHeight(30)
+        self.btn_cancel.setFixedWidth(84)
         self.btn_cancel.clicked.connect(self.reject)
 
         self.btn_confirm = QPushButton("Confirm Selection")
         self.btn_confirm.setObjectName("primaryButton")
+        self.btn_confirm.setFixedHeight(30)
         self.btn_confirm.clicked.connect(self._on_confirm_clicked)
 
         bottom_row.addWidget(tip_lbl)
